@@ -1,0 +1,6 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- AppCompat 系の Material3 テーマ -->
+    <style name="Theme.AssetForecast" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- 余計な指定は一旦なし -->
+    </style>
+</resources>

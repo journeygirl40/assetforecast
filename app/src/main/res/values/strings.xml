@@ -1,0 +1,35 @@
+<resources>
+    <string name="app_name">資産額管理・予測 — 資産の未来を見える化</string>
+    <string name="title_app">資産額管理・予測</string>
+    <string name="action_settings">設定</string>
+
+    <string name="chart_no_data">No data</string>
+
+    <string name="add_title">New Entry</string>
+    <string name="edit_title">Edit</string>
+    <string name="date_label">Date (yyyy-MM-dd)</string>
+    <string name="amount_label">Amount (JPY)</string>
+    <string name="note_label">Note (optional)</string>
+
+    <string name="btn_add">Add</string>
+    <string name="btn_change">Update</string>
+    <string name="btn_delete">Delete</string>
+    <string name="btn_cancel">Cancel</string>
+    <string name="btn_save">Save</string>
+    <string name="btn_close">Close</string>
+
+    <string name="settings_title">Forecast Settings</string>
+    <string name="mode_avg">Average (recent N)</string>
+    <string name="mode_custom">Fixed delta</string>
+    <string name="n_count">N (samples)</string>
+    <string name="n_all">All</string>
+    <string name="n_custom">Custom</string>
+    <string name="custom_n_label">Custom N (items)</string>
+    <string name="custom_delta_label">Fixed delta (JPY / month)</string>
+    <string name="months_label">Months (12–600)</string>
+
+    <string name="lang_title">Language</string>
+    <string name="lang_system">System</string>
+    <string name="lang_ja">日本語</string>
+    <string name="lang_en">English</string>
+</resources>

@@ -1,0 +1,35 @@
+<resources>
+    <string name="app_name">資産額管理・予測 — 資産の未来を見える化</string>
+    <string name="title_app">資産額管理・予測</string>
+    <string name="action_settings">設定</string>
+
+    <string name="chart_no_data">データがありません</string>
+
+    <string name="add_title">新規入力</string>
+    <string name="edit_title">編集</string>
+    <string name="date_label">日付 (yyyy-MM-dd)</string>
+    <string name="amount_label">資産額（円）</string>
+    <string name="note_label">備考（任意）</string>
+
+    <string name="btn_add">登録</string>
+    <string name="btn_change">変更</string>
+    <string name="btn_delete">削除</string>
+    <string name="btn_cancel">キャンセル</string>
+    <string name="btn_save">保存</string>
+    <string name="btn_close">閉じる</string>
+
+    <string name="settings_title">将来予測の設定</string>
+    <string name="mode_avg">平均（直近N）</string>
+    <string name="mode_custom">固定指定</string>
+    <string name="n_count">N（取得数）</string>
+    <string name="n_all">全て</string>
+    <string name="n_custom">カスタム</string>
+    <string name="custom_n_label">カスタムN（件数）</string>
+    <string name="custom_delta_label">固定の増減額（円/月）</string>
+    <string name="months_label">予測月数（12〜600）</string>
+
+    <string name="lang_title">言語</string>
+    <string name="lang_system">端末設定に従う</string>
+    <string name="lang_ja">日本語</string>
+    <string name="lang_en">English</string>
+</resources>
