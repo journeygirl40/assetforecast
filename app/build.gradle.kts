@@ -15,8 +15,8 @@ android {
         applicationId = "com.journeygirl.assetforecast"
         minSdk = 24
         targetSdk = 35
-        versionCode = 17
-        versionName = "3.5"
+        versionCode = 18
+        versionName = "3.6"
     }
 
     buildFeatures { compose = true }
@@ -43,7 +43,6 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.navigation:navigation-compose:2.8.3")
-    implementation("com.android.billingclient:billing:6.1.0")
     // Compose core & Material3
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
