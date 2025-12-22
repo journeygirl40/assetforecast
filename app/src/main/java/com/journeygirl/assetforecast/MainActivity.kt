@@ -186,6 +186,7 @@ class MainActivity : ComponentActivity() {
                         com.journeygirl.assetforecast.ads.AdsManager.UNITY_TEST_MODE
                     )
                 }
+                showAds = true // ★これを追加（初期化が終わったら広告表示を許可）
             }
         }
     }
@@ -202,10 +203,10 @@ fun AppRoot(
 
     // ▼ ボタンの位置（ドラッグで更新）
     var fabOffsetX by remember { mutableStateOf(0f) }
-    var fabOffsetY by remember { mutableStateOf(0f) }
+    var fabOffsetY by remember { mutableStateOf(-130f) }
 
     var settingsOffsetX by remember { mutableStateOf(0f) }
-    var settingsOffsetY by remember { mutableStateOf(0f) }
+    var settingsOffsetY by remember { mutableStateOf(-130f) }
 
     val settings by vm.settings.collectAsState()
     LaunchedEffect(settings.language) { vm.applyLanguage(settings.language) }
@@ -406,163 +407,168 @@ fun AppRoot(
                 }
             }
         },
-        bottomBar = {
-            if (!settings.adFree) { // ← 条件は残す！
-                Box(
-                    Modifier
-                        .fillMaxWidth()
-                        .wrapContentHeight()     // ← 高さは中身に合わせる
-                        .navigationBarsPadding()   // ← これで最下部に固定
-                ) {
-                    BannerAdView(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .align(Alignment.BottomCenter)
-                    )
-                }
-            }
-        }
     ) { inner ->
-        // 画面全体の高さが必要なので BoxWithConstraints を使う
-        BoxWithConstraints(
+        Box(
             Modifier
                 .fillMaxSize()
                 .padding(inner)          // ✅ Scaffold から渡される安全領域を反映
         ) {
-            val density = LocalDensity.current
-            val totalPx = with(density) { maxHeight.toPx() }         // 有効ドラッグ量の基準
-            var split by rememberSaveable { mutableStateOf(0.45f) }   // 上(グラフ)の比率 0.0..1.0
-            val handleHeight = 12.dp                                  // つまみの高さ
-            val latestEpochDays: Int? = records.maxByOrNull { it.dateEpochDays }?.dateEpochDays
+            BoxWithConstraints(Modifier.fillMaxSize()) {
+                val density = LocalDensity.current
+                val totalPx = with(density) { maxHeight.toPx() }         // 有効ドラッグ量の基準
+                var split by rememberSaveable { mutableStateOf(0.45f) }   // 上(グラフ)の比率 0.0..1.0
+                val handleHeight = 12.dp                                  // つまみの高さ
+                val latestEpochDays: Int? = records.maxByOrNull { it.dateEpochDays }?.dateEpochDays
 
-            Column(Modifier.fillMaxSize()) {
+                Column(Modifier.fillMaxSize()) {
 
-                // ── 上：グラフ（高さは split に応じて可変） ──
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(split)
-                ) {
-                    AssetChartSection(
-                        records = records,
-                        forecastMonths = settings.months,
-                        sampleN = settings.sampleN,
-                        mode = settings.mode,
-                        customRateMonthly = settings.customRatePerMonth,
-                        customDeltaPerMonth = settings.customDeltaPerMonth,
-                        drawdownStartMonth = settings.drawdownStartMonth,
-                        withdrawPerMonth  = settings.withdrawPerMonth,
-                        onPointSelected = { epochDaysOrNull: Int? ->
-                            selectedId = epochDaysOrNull?.let { picked ->
-                                records.minByOrNull { r -> kotlin.math.abs(r.dateEpochDays - picked) }?.id
-                            }
-                            selectionSource = SelectionSource.CHART
-                        },
-                        modifier = Modifier
-                            .fillMaxSize() // ← Box 全体にグラフを広げる
-                            .padding(0.dp),
-                        // ▼ 追加：初期ハイライトに最新実績を渡す
-                        initialHighlightEpochDays = latestEpochDays
-                    )
-                }
-
-                // ── 中央：ドラッグつまみ ──
-                Box(
-                    Modifier
-                        .fillMaxWidth()
-                        .height(handleHeight)
-                        .background(MaterialTheme.colorScheme.surfaceVariant)
-                        .draggable(
-                            orientation = Orientation.Vertical,
-                            state = rememberDraggableState { dy ->
-                                // dy(px) を全体高さで割って比率に変換し、0.15〜0.85にクランプ
-                                if (totalPx > 0f) {
-                                    split = (split + dy / totalPx).coerceIn(0.15f, 0.85f)
-                                }
-                            }
-                        ),
-                    contentAlignment = Alignment.Center
-                ) {
-                    // つまみの見た目（小さなバー）
+                    // ── 上：グラフ（高さは split に応じて可変） ──
                     Box(
-                        Modifier
-                            .width(48.dp)
-                            .height(4.dp)
-                            .background(
-                                MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
-                                RoundedCornerShape(2.dp)
-                            )
-                    )
-                }
-
-                // ── 下：リスト（残りの高さ） ──
-                @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f - split)     // ← 残りの比率
-                        .padding(horizontal = 8.dp),
-                    contentPadding = PaddingValues(bottom = 72.dp)
-                ) {
-                    stickyHeader { ListHeader() }
-
-                    val list = records.sortedBy { it.dateEpochDays }
-
-                    itemsIndexed(list) { index, r ->
-                        val prevAmount = list.getOrNull(index - 1)?.amount
-                        val diff = if (prevAmount == null) 0L else (r.amount - prevAmount)
-
-                        RecordRow(
-                            r = r,
-                            selected = (r.id == selectedId),
-                            diff = diff,
-                            onClick = {
-                                if (selectedId == r.id) {
-                                    editing = r
-                                    selectedId = null
-                                    selectionSource = null
-                                } else {
-                                    selectedId = r.id
-                                    selectionSource = SelectionSource.LIST   // ← リスト由来なのでスクロールしない
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(split)
+                    ) {
+                        AssetChartSection(
+                            records = records,
+                            forecastMonths = settings.months,
+                            sampleN = settings.sampleN,
+                            mode = settings.mode,
+                            customRateMonthly = settings.customRatePerMonth,
+                            customDeltaPerMonth = settings.customDeltaPerMonth,
+                            drawdownStartMonth = settings.drawdownStartMonth,
+                            withdrawPerMonth = settings.withdrawPerMonth,
+                            onPointSelected = { epochDaysOrNull: Int? ->
+                                selectedId = epochDaysOrNull?.let { picked ->
+                                    records.minByOrNull { r -> kotlin.math.abs(r.dateEpochDays - picked) }?.id
                                 }
-                            }
+                                selectionSource = SelectionSource.CHART
+                            },
+                            modifier = Modifier
+                                .fillMaxSize() // ← Box 全体にグラフを広げる
+                                .padding(0.dp),
+                            // ▼ 追加：初期ハイライトに最新実績を渡す
+                            initialHighlightEpochDays = latestEpochDays
                         )
                     }
 
-// ─── 将来予測ブロック ───
-                    if (forecasts.isNotEmpty() || monthCount >= 2) {
-                        // タイトル行（非固定）
-                        item {
-                            val suffix = avgRateForLabel ?: "（-）"
-                            Text(
-                                text = "将来予測$suffix",
-                                style = MaterialTheme.typography.titleSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(top = 8.dp, start = 8.dp, end = 8.dp)
+                    // ── 中央：ドラッグつまみ ──
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(handleHeight)
+                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                            .draggable(
+                                orientation = Orientation.Vertical,
+                                state = rememberDraggableState { dy ->
+                                    // dy(px) を全体高さで割って比率に変換し、0.15〜0.85にクランプ
+                                    if (totalPx > 0f) {
+                                        split = (split + dy / totalPx).coerceIn(0.15f, 0.85f)
+                                    }
+                                }
+                            ),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        // つまみの見た目（小さなバー）
+                        Box(
+                            Modifier
+                                .width(48.dp)
+                                .height(4.dp)
+                                .background(
+                                    MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                                    RoundedCornerShape(2.dp)
+                                )
+                        )
+                    }
+
+                    // ── 下：リスト（残りの高さ） ──
+                    @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f - split)     // ← 残りの比率
+                            .padding(horizontal = 8.dp),
+                        contentPadding = PaddingValues(bottom = 0.dp)
+                    ) {
+                        stickyHeader { ListHeader() }
+
+                        val list = records.sortedBy { it.dateEpochDays }
+
+                        itemsIndexed(list) { index, r ->
+                            val prevAmount = list.getOrNull(index - 1)?.amount
+                            val diff = if (prevAmount == null) 0L else (r.amount - prevAmount)
+
+                            RecordRow(
+                                r = r,
+                                selected = (r.id == selectedId),
+                                diff = diff,
+                                onClick = {
+                                    if (selectedId == r.id) {
+                                        editing = r
+                                        selectedId = null
+                                        selectionSource = null
+                                    } else {
+                                        selectedId = r.id
+                                        selectionSource =
+                                            SelectionSource.LIST   // ← リスト由来なのでスクロールしない
+                                    }
+                                }
                             )
                         }
-                        // ← ヘッダーを stickyHeader に（実績と同じ動き）
-                        stickyHeader { ForecastHeaderRow() }
 
-                        // 予測行（年月日 / 追加金額 / 差分 / 資産額）
-                        itemsIndexed(forecasts) { idx, p ->
-                            val prevAmount =
-                                if (idx == 0) records.maxByOrNull { it.dateEpochDays }?.amount ?: p.amount
-                                else forecasts[idx - 1].amount
-                            val diff = p.amount - prevAmount
-                            ForecastRow(
-                                p = p,
-                                diff = diff,                 // ← 差分
-                                addFixed = p.addFixed ?: 0L  // ← 固定追加（未使用なら 0）
-                            )
+// ─── 将来予測ブロック ───
+                        if (forecasts.isNotEmpty() || monthCount >= 2) {
+                            // タイトル行（非固定）
+                            item {
+                                val suffix = avgRateForLabel ?: "（-）"
+                                Text(
+                                    text = "将来予測$suffix",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(
+                                        top = 8.dp,
+                                        start = 8.dp,
+                                        end = 8.dp
+                                    )
+                                )
+                            }
+                            // ← ヘッダーを stickyHeader に（実績と同じ動き）
+                            stickyHeader { ForecastHeaderRow() }
+
+                            // 予測行（年月日 / 追加金額 / 差分 / 資産額）
+                            itemsIndexed(forecasts) { idx, p ->
+                                val prevAmount =
+                                    if (idx == 0) records.maxByOrNull { it.dateEpochDays }?.amount
+                                        ?: p.amount
+                                    else forecasts[idx - 1].amount
+                                val diff = p.amount - prevAmount
+                                ForecastRow(
+                                    p = p,
+                                    diff = diff,                 // ← 差分
+                                    addFixed = p.addFixed ?: 0L  // ← 固定追加（未使用なら 0）
+                                )
+                            }
                         }
                     }
                 }
             }
+            // ===== 広告（overlay：コンテンツを押し上げない）=====
+            if (showAds && !settings.adFree) {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .align(Alignment.BottomCenter)
+                        .zIndex(10f)
+                ) {
+                    BannerAdView(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .wrapContentHeight()
+                    )
+                }
+            }
         }
     }
-
     if (showAdd) {
         AddDialog(
             onDismiss = { showAdd = false },
@@ -1017,7 +1023,7 @@ fun SettingsDialog(
 //                    )
 //                    Switch(checked = adFree, onCheckedChange = { adFree = it })
 //                }
-                    // ～～（既存の設定項目の下あたりに追記）～～
+//                     ～～（既存の設定項目の下あたりに追記）～～
                     Divider()
                     Text(
                         text = "CSV インポート / エクスポート",
