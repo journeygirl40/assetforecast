@@ -1591,6 +1591,7 @@ fun AssetChartSection(
                 circleRadius = 5f
                 setDrawValues(false)
                 this.mode = LineDataSet.Mode.LINEAR   // ← ここを this.mode に
+                applyAreaFill(actualColorArgb)
             }
 
             // ★ 月のユニーク数を数える（yyyyMM 単位）
@@ -1650,6 +1651,7 @@ fun AssetChartSection(
                         lineWidth = 2f
                         setDrawValues(false)
                         this.mode = LineDataSet.Mode.LINEAR
+                        applyAreaFill(forecastColorArgb)
                     }
                     dataSets += forecastSet
                 }
@@ -2919,4 +2921,17 @@ private tailrec fun android.content.Context.findActivity(): android.app.Activity
     is android.app.Activity -> this
     is android.content.ContextWrapper -> baseContext.findActivity()
     else -> null
+}
+
+// 折れ線の下を同系色で塗る（上が薄い色、下に向かって透明になるグラデーション）。
+// 線の色から作るので、設定の「カラー」で色を変えても塗りが追従する。
+private fun LineDataSet.applyAreaFill(lineColorArgb: Int) {
+    setDrawFilled(true)
+    fillDrawable = android.graphics.drawable.GradientDrawable(
+        android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
+        intArrayOf(
+            androidx.core.graphics.ColorUtils.setAlphaComponent(lineColorArgb, 0x55),
+            androidx.core.graphics.ColorUtils.setAlphaComponent(lineColorArgb, 0x00)
+        )
+    )
 }
