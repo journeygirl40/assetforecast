@@ -10,6 +10,16 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.core.view.WindowCompat
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.shape.CircleShape
+import com.journeygirl.assetforecast.ui.theme.ColorPresets
+import com.journeygirl.assetforecast.ui.theme.JapaneseStyleChoices
+import com.journeygirl.assetforecast.ui.theme.LocalSeriesColors
+import com.journeygirl.assetforecast.ui.theme.SeriesColorChoices
+import com.journeygirl.assetforecast.ui.theme.WesternStyleChoices
+import com.journeygirl.assetforecast.ui.theme.customChoice
+import com.journeygirl.assetforecast.ui.theme.presetChoice
+import com.journeygirl.assetforecast.ui.theme.resolveColorChoice
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -22,6 +32,8 @@ import com.journeygirl.assetforecast.data.prefs.ForecastSettings
 import com.journeygirl.assetforecast.viewmodel.MainViewModel
 import com.github.mikephil.charting.charts.LineChart
 import com.github.mikephil.charting.components.XAxis
+import com.github.mikephil.charting.components.YAxis
+import com.github.mikephil.charting.utils.MPPointD
 import com.github.mikephil.charting.data.Entry
 import com.github.mikephil.charting.data.LineData
 import com.github.mikephil.charting.data.LineDataSet
@@ -43,8 +55,13 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.runtime.*
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.border
+import androidx.compose.ui.layout.onSizeChanged
 import android.graphics.Color as AndroidColor
 import androidx.compose.ui.graphics.Color as ComposeColor
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.foundation.lazy.rememberLazyListState
 import com.github.mikephil.charting.listener.OnChartValueSelectedListener
 import com.github.mikephil.charting.highlight.Highlight
@@ -138,20 +155,34 @@ class MainActivity : ComponentActivity() {
         // ② ステータスバーを透明に
         window.statusBarColor = android.graphics.Color.TRANSPARENT
 
-        // ③ ステータスバーのアイコンを「ダーク（黒寄り）」に
-        val controller = WindowCompat.getInsetsController(window, window.decorView)
-        controller.isAppearanceLightStatusBars = true   // ← これが肝
-        // （必要ならナビゲーションバーも）
-        controller.isAppearanceLightNavigationBars = true
-
-
         // 画面を先に描画
         setContent {
-            var showAds by remember { mutableStateOf(false) }   // ← 広告表示トリガー
-            AppRoot(vm = vm, showAds = showAds)
+            // 設定画面の「テーマ」選択（system/light/dark）に応じてダーク/ライトを決定する。
+            // "system"の場合のみ端末設定に追従する。
+            val settings by vm.settings.collectAsState()
+            val darkTheme = when (settings.themeMode) {
+                "light" -> false
+                "dark" -> true
+                else -> androidx.compose.foundation.isSystemInDarkTheme()
+            }
+            com.journeygirl.assetforecast.ui.theme.AssetforecastTheme(
+                darkTheme = darkTheme,
+                seriesColorChoices = settings.seriesColorChoices()
+            ) {
+                // ③ ステータスバー/ナビゲーションバーのアイコン色は、ダーク基調テーマでは
+                // 濃い背景に馴染むよう白寄りに、ライトモードでは黒寄りに動的に切り替える。
+                val view = androidx.compose.ui.platform.LocalView.current
+                androidx.compose.runtime.SideEffect {
+                    val controller = WindowCompat.getInsetsController(window, view)
+                    controller.isAppearanceLightStatusBars = !darkTheme
+                    controller.isAppearanceLightNavigationBars = !darkTheme
+                }
 
-            // UI表示後に重い初期化を非同期で実行
-            LaunchedEffect(Unit) {
+                var showAds by remember { mutableStateOf(false) }   // ← 広告表示トリガー
+                AppRoot(vm = vm, showAds = showAds)
+
+                // UI表示後に重い初期化を非同期で実行
+                LaunchedEffect(Unit) {
                 // UMP（同意管理）を非同期初期化
                 runCatching {
                     val params = ConsentRequestParameters.Builder().build()
@@ -187,6 +218,7 @@ class MainActivity : ComponentActivity() {
                     )
                 }
                 showAds = true // ★これを追加（初期化が終わったら広告表示を許可）
+                }
             }
         }
     }
@@ -217,6 +249,38 @@ fun AppRoot(
     var selectedId by remember { mutableStateOf<Long?>(null) }   // ← AssetRecord.id が Int の想定
     var selectionSource by remember { mutableStateOf<SelectionSource?>(null) }
     val listState = rememberLazyListState()
+
+    // ▼ グラフのミニマップナビゲーター用の表示範囲。アプリを閉じても同じ範囲に戻れるよう永続化する。
+    // DisplayRangeのstart/endはそれぞれ独立にnull（無制限）になり得るため、Pair<Int,Int>のような
+    // 「両方とも具体値」前提の型にすると、片方だけnullな状態を表現できず不正な範囲になってしまう。
+    val savedDisplayRange by vm.displayRange.collectAsState()
+    var customRange by remember { mutableStateOf<DisplayRange?>(null) }
+    // 起動直後に保存値を1回だけcustomRangeへ復元するためのフラグ。これが立つまでは
+    // 下のLaunchedEffect(customRange)による保存処理を走らせない（復元した値をそのまま
+    // 書き戻すだけの無駄な保存や、復元前のnull状態での上書きを防ぐため）。
+    var displayRangeLoaded by remember { mutableStateOf(false) }
+
+    LaunchedEffect(savedDisplayRange) {
+        // savedDisplayRangeがnullの間はDataStoreからまだ読み込めていない状態なので待つ。
+        val saved = savedDisplayRange ?: return@LaunchedEffect
+        if (!displayRangeLoaded) {
+            customRange = if (saved.start == null && saved.end == null) {
+                null
+            } else {
+                DisplayRange(saved.start, saved.end)
+            }
+            displayRangeLoaded = true
+        }
+    }
+
+    // ミニマップのドラッグ中は高頻度でcustomRangeが変わるため、都度DataStoreへ書き込まず、
+    // 操作が止まってから保存する（デバウンス）。
+    LaunchedEffect(customRange, displayRangeLoaded) {
+        if (displayRangeLoaded) {
+            kotlinx.coroutines.delay(400)
+            vm.saveDisplayRange(customRange?.start, customRange?.end)
+        }
+    }
 
     val context = androidx.compose.ui.platform.LocalContext.current
 
@@ -419,10 +483,42 @@ fun AppRoot(
                 var split by rememberSaveable { mutableStateOf(0.45f) }   // 上(グラフ)の比率 0.0..1.0
                 val handleHeight = 12.dp                                  // つまみの高さ
                 val latestEpochDays: Int? = records.maxByOrNull { it.dateEpochDays }?.dateEpochDays
+                // グラフ（またはリスト）で選択中の記録の日付。ミニマップ上に選択位置をマーカー表示するために使う。
+                val selectedEpochDays: Int? = remember(records, selectedId) {
+                    selectedId?.let { id -> records.firstOrNull { it.id == id }?.dateEpochDays }
+                }
+
+                // ▼ ミニマップナビゲーターの選択範囲から実際のグラフ表示範囲を算出（null=全期間）
+                val displayRange: DisplayRange = customRange ?: DisplayRange(null, null)
 
                 Column(Modifier.fillMaxSize()) {
 
-                    // ── 上：グラフ（高さは split に応じて可変） ──
+                    // ── 上：全期間（実績＋予測）の簡易推移＋現在の表示範囲ハイライト（ナビゲーター） ──
+                    // ミニマップの背景には常に実績・予測全体の推移が描かれているため、専用のリセット
+                    // ボタンは置かず、ハンドル／ハイライト枠のドラッグだけで全期間表示へ戻せるようにする。
+                    MiniMapNavigator(
+                        records = records,
+                        forecasts = forecasts,
+                        range = displayRange,
+                        selectedEpochDays = selectedEpochDays,
+                        onRangeChange = { newRange ->
+                            customRange = if (newRange.start == null && newRange.end == null) null else newRange
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                    // ミニマップで選んだ期間の差分平均・増減率（グラフの高さを奪わないよう1行の小さな帯にする）。
+                    // ミニマップの補足情報なので控えめな文字にし、下の「選択中の日付・金額」との間は少し空けて別物に見せる。
+                    RangeStatsStrip(
+                        records = records,
+                        range = displayRange,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 8.dp, end = 8.dp, bottom = 6.dp)
+                    )
+
+                    // ── ミニマップ下：グラフ（高さは split に応じて可変） ──
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -437,6 +533,7 @@ fun AppRoot(
                             customDeltaPerMonth = settings.customDeltaPerMonth,
                             drawdownStartMonth = settings.drawdownStartMonth,
                             withdrawPerMonth = settings.withdrawPerMonth,
+                            range = displayRange,
                             onPointSelected = { epochDaysOrNull: Int? ->
                                 selectedId = epochDaysOrNull?.let { picked ->
                                     records.minByOrNull { r -> kotlin.math.abs(r.dateEpochDays - picked) }?.id
@@ -605,6 +702,18 @@ fun AppRoot(
             },
             onImportCsv = {
                 importLauncher.launch("text/*") // 端末によっては "text/comma-separated-values" しか出ないケースがあるため広めに
+            },
+            // テーマだけを即時保存する。保存済みsettingsを基にするので、ダイアログで編集中の
+            // 未保存の他項目（予測年数など）はここでは書き込まれない。
+            onThemeModeChange = { vm.saveSettings(settings.copy(themeMode = it)) },
+            // 色もテーマと同様に即時保存・反映する
+            onSeriesColorsChange = { c ->
+                vm.saveSettings(
+                    settings.copy(
+                        colorGain = c.gain, colorLoss = c.loss,
+                        colorActual = c.actual, colorForecast = c.forecast
+                    )
+                )
             }
         )
     }
@@ -781,7 +890,10 @@ fun SettingsDialog(
     onClose: () -> Unit,
     onSave: (ForecastSettings) -> Unit,
     onExportCsv: () -> Unit,     // ← 追加
-    onImportCsv: () -> Unit      // ← 追加
+    onImportCsv: () -> Unit,     // ← 追加
+    // テーマはチップを押した瞬間に保存・反映する（「保存」ボタンを待たずに見た目を確認できるように）
+    onThemeModeChange: (String) -> Unit = {},
+    onSeriesColorsChange: (SeriesColorChoices) -> Unit = {}
 ) {
     var mode by remember { mutableStateOf(current.mode) } // "avg" or "custom"
     var sampleChoice by remember { mutableStateOf(current.sampleN) } // 10/20/50/-1/カスタム値
@@ -805,6 +917,7 @@ fun SettingsDialog(
         )
     }
     var lang by remember { mutableStateOf(current.language) }
+    var themeMode by remember { mutableStateOf(current.themeMode) }
     var adFree by remember { mutableStateOf(current.adFree) }
     var fixedAddText by remember { mutableStateOf((current.customDeltaPerMonth ?: 0L).takeIf { it != 0L }?.toString() ?: "") }
 
@@ -846,12 +959,12 @@ fun SettingsDialog(
                         color = MaterialTheme.colorScheme.primary,
                         textAlign = TextAlign.Center
                     )
-                    OutlinedTextField(
+                    SettingsField(
                         value = yearsText,
                         onValueChange = { yearsText = it.filter { ch -> ch.isDigit() }.take(3) },
-                        label = { Text("予測年数（0〜100）") },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                        label = "予測年数",
+                        suffix = "年",
+                        supportingText = "0〜100 年"
                     )
                     Text(
                         text = "年率の指定",
@@ -905,21 +1018,20 @@ fun SettingsDialog(
                             var customNText by remember {
                                 mutableStateOf((current.sampleN.takeIf { it > 0 } ?: 10).toString())
                             }
-                            OutlinedTextField(
+                            SettingsField(
                                 value = customNText,
                                 onValueChange = {
                                     customNText = it.filter { ch -> ch.isDigit() }.take(4)
                                 },
-                                label = { Text("カスタムN（件数）") },
-                                singleLine = true,
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                                label = "カスタムN",
+                                suffix = "件"
                             )
                             sampleChoice = customNText.toIntOrNull() ?: sampleChoice
                         }
 
                     } else {
                         if (mode == "custom") {
-                            OutlinedTextField(
+                            SettingsField(
                                 value = customAnnualText,
                                 onValueChange = { raw ->
                                     // 数字・小数点・マイナス符号だけ許可
@@ -932,11 +1044,10 @@ fun SettingsDialog(
                                     if (t.isNotEmpty() && t.first() != '-') t = t.replace("-", "")
                                     customAnnualText = t.take(7)
                                 },
-                                label = { Text("固定の増減率") },
-                                placeholder = { Text("例: 4") },
-                                trailingIcon = { Text("%/年") },   // 単位明示
-                                singleLine = true,
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal)
+                                label = "年率（マイナス可）",
+                                suffix = "%/年",
+                                placeholder = "例: 4",
+                                keyboardType = KeyboardType.Decimal
                             )
                         }
                     }
@@ -949,21 +1060,15 @@ fun SettingsDialog(
                         color = MaterialTheme.colorScheme.primary,
                         textAlign = TextAlign.Center
                     )
-                    OutlinedTextField(
+                    SettingsField(
                         value = fixedAddText,
                         onValueChange = { t ->
                             // 符号は不要にするなら数字だけ許可
                             fixedAddText = t.filter { it.isDigit() }.take(10)
                         },
-                        label = {
-                            Text(
-                                "固定追加金額（円/月）",
-                                style = MaterialTheme.typography.labelSmall
-                            )
-                        },
-                        placeholder = { Text("例: 30000") },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                        label = "毎月の追加額",
+                        suffix = "円/月",
+                        placeholder = "未設定（例: 30000）"
                     )
                     Text(
                         text = "切り崩し設定",
@@ -974,36 +1079,24 @@ fun SettingsDialog(
                         textAlign = TextAlign.Center
                     )
 
-                    OutlinedTextField(
+                    SettingsField(
                         value = drawdownStartYearsText,
                         onValueChange = {
                             drawdownStartYearsText = it.filter { ch -> ch.isDigit() }.take(3)
                         },
-                        label = {
-                            Text(
-                                "〇年後から（予測年数未満）",
-                                style = MaterialTheme.typography.labelSmall
-                            )
-                        },
-                        supportingText = { Text("例：予測 30 年なら 0〜29 のいずれか") },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                        label = "開始時期",
+                        suffix = "年後から",
+                        supportingText = "予測年数未満（例：予測 30 年なら 0〜29）"
                     )
 
-                    OutlinedTextField(
+                    SettingsField(
                         value = withdrawPerMonthText,
                         onValueChange = {
                             withdrawPerMonthText = it.filter { it.isDigit() }.take(10)
                         },
-                        label = {
-                            Text(
-                                "固定切り崩し金額（円/月）",
-                                style = MaterialTheme.typography.labelSmall
-                            )
-                        },
-                        placeholder = { Text("例: 50000") },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                        label = "毎月の切り崩し額",
+                        suffix = "円/月",
+                        placeholder = "未設定（例: 50000）"
                     )
 
 //                Divider()
@@ -1024,6 +1117,48 @@ fun SettingsDialog(
 //                    Switch(checked = adFree, onCheckedChange = { adFree = it })
 //                }
 //                     ～～（既存の設定項目の下あたりに追記）～～
+                    Divider()
+                    Text(
+                        text = "テーマ",
+                        style = MaterialTheme.typography.labelMedium.copy(
+                            fontWeight = FontWeight.Bold
+                        ),
+                        color = MaterialTheme.colorScheme.primary,
+                        textAlign = TextAlign.Center
+                    )
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilterChip(
+                            selected = themeMode == "system",
+                            onClick = { themeMode = "system"; onThemeModeChange("system") },
+                            label = { Text("端末設定") }
+                        )
+                        FilterChip(
+                            selected = themeMode == "light",
+                            onClick = { themeMode = "light"; onThemeModeChange("light") },
+                            label = { Text("ライト") }
+                        )
+                        FilterChip(
+                            selected = themeMode == "dark",
+                            onClick = { themeMode = "dark"; onThemeModeChange("dark") },
+                            label = { Text("ダーク") }
+                        )
+                    }
+                    Divider()
+                    Text(
+                        text = "カラー",
+                        style = MaterialTheme.typography.labelMedium.copy(
+                            fontWeight = FontWeight.Bold
+                        ),
+                        color = MaterialTheme.colorScheme.primary,
+                        textAlign = TextAlign.Center
+                    )
+                    SeriesColorSettings(
+                        choices = current.seriesColorChoices(),
+                        onChange = onSeriesColorsChange
+                    )
                     Divider()
                     Text(
                         text = "CSV インポート / エクスポート",
@@ -1069,7 +1204,8 @@ fun SettingsDialog(
                         Spacer(modifier = Modifier.width(10.dp))
                         Text(
                             text = "ページを開く",
-                            color = Color.Blue, // 青文字
+                            // 固定の Color.Blue だとダークテーマの暗い背景で読めないため、テーマのリンク色（ブルー）を使う
+                            color = MaterialTheme.colorScheme.secondary,
                             textDecoration = TextDecoration.Underline // 下線付き
                         )
                     }
@@ -1213,7 +1349,8 @@ fun SettingsDialog(
                 val withdrawPerMonth: Long? = withdrawPerMonthText.toLongOrNull()?.takeIf { it > 0L }
 
                 onSave(
-                    ForecastSettings(
+                    // current.copy にして、このダイアログに入力欄の無い項目（色など即時保存済みの設定）を消さない
+                    current.copy(
                         mode = mode,
                         sampleN = finalSample,
                         months = months,
@@ -1222,6 +1359,7 @@ fun SettingsDialog(
                         drawdownStartMonth = ddStartMonth,
                         withdrawPerMonth = withdrawPerMonth,
                         language = lang,
+                        themeMode = themeMode,
                         adFree = adFree
                     )
                 )
@@ -1242,17 +1380,69 @@ fun AssetChartSection(
     customDeltaPerMonth: Long? = null,      // ★ 追加
     drawdownStartMonth: Int? = null,    // ← デフォルトを付ける
     withdrawPerMonth: Long? = null,     // ← デフォルトを付ける
+    range: DisplayRange = DisplayRange(null, null), // ← ミニマップナビゲーターで選択された表示範囲
     onPointSelected: (Int?) -> Unit = {},
     initialHighlightEpochDays: Int? = null // ← これを追加
 ) {
+    val lastRangeKey = remember { mutableStateOf<Pair<Int?, Int?>?>(null) }
+    // 予測線が実際に描画されたか（データ不足等で描画されない月もあるため、凡例バッジの出し分けに使う）
+    var hasForecast by remember { mutableStateOf(false) }
+    // グラフで選択中の点。バッジ行の中央に日付・金額を表示するために使う（以前のふきだしMarkerの代わり）
+    var selectedPoint by remember { mutableStateOf<SelectedChartPoint?>(null) }
+
+    // MPAndroidChart(AndroidView)はComposeのMaterialTheme.colorSchemeを直接参照できないため、
+    // ここでARGBに変換してfactory/updateへ渡す。ダーク/ライト切替時もupdateで毎回設定し直すことで追従させる。
+    val onSurfaceVariantColorArgb = MaterialTheme.colorScheme.onSurfaceVariant.toArgb()
+    // グリッド線は控えめに見せたいので、入力枠用のoutlineではなく区切り線用のoutlineVariantを使う
+    val outlineColorArgb = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f).toArgb()
+    // 実績・予測の線の色（初期色はブルー/グリーン。設定の「カラー」で変更できる）
+    val actualColor = LocalSeriesColors.current.actual
+    val forecastColor = LocalSeriesColors.current.forecast
+    val actualColorArgb = actualColor.toArgb()
+    val forecastColorArgb = forecastColor.toArgb()
+
+    Column(modifier) {
+        // ── 凡例の代わりに「実績」「予測」を表のタイトルのようなバッジでグラフ直上に表示する。
+        // MPAndroidChart標準のLegendは行の高さを取るため非表示にし、節約した分をグラフ本体に回す。
+        // バッジの間の空きスペースには選択中の点の日付・金額を表示する。左右バッジの幅に
+        // 左右されず常に画面中央に来るよう、RowではなくBoxで重ねて配置している。
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .padding(start = 4.dp, end = 4.dp, bottom = 2.dp)
+        ) {
+            ChartSeriesBadge(
+                text = "実績",
+                color = actualColor,
+                modifier = Modifier.align(Alignment.CenterStart)
+            )
+            selectedPoint?.let { p ->
+                SelectedPointReadout(
+                    point = p,
+                    color = if (p.isForecast) forecastColor else actualColor,
+                    modifier = Modifier.align(Alignment.Center)
+                )
+            }
+            if (hasForecast) {
+                ChartSeriesBadge(
+                    text = "予測",
+                    color = forecastColor,
+                    modifier = Modifier.align(Alignment.CenterEnd)
+                )
+            }
+        }
+
     AndroidView(
-        modifier = modifier
+        modifier = Modifier
             .fillMaxWidth()
-            .height(200.dp),
+            .weight(1f),
         factory = { context ->
             LineChart(context).apply {
+                // Compose側の背景（テーマのbackground）を透かすため、チャート自体は透明背景にする
+                setBackgroundColor(AndroidColor.TRANSPARENT)
                 description.isEnabled = false
                 setNoDataText("データがありません")
+                setNoDataTextColor(onSurfaceVariantColorArgb)
                 setPinchZoom(true)
                 setScaleEnabled(true)
                 setAutoScaleMinMaxEnabled(true)    // データ範囲に合わせて自動スケール
@@ -1260,32 +1450,45 @@ fun AssetChartSection(
                 xAxis.position = XAxis.XAxisPosition.BOTTOM
                 xAxis.setDrawGridLines(true)
                 xAxis.setGranularityEnabled(true)
-                legend.isEnabled = true
+                legend.isEnabled = false
                 setDrawMarkers(true)
 
                 // ▼ 追加：縦軸（Y軸）の金額文字サイズを小さく
                 axisLeft.textSize = 8f  // ← デフォルトは 10〜12f 程度。8fなら少し小さめ。
-
-                marker = TextMarker(
-                    context = context,
-                    xFormatter = DateTimeFormatter.ofPattern("yyyy/MM/dd"),
-                    yFormatter = { v -> "¥" + formatYen(v.toLong()) },
-                    // “2mm 上” に出したいので mm→px 変換でオフセット指定
-                    offsetLeftPx = mmToPx(context, 2f),
-                    offsetDownPx = -mmToPx(context, 3f)
-                )
+                xAxis.textColor = onSurfaceVariantColorArgb
+                axisLeft.textColor = onSurfaceVariantColorArgb
+                xAxis.gridColor = outlineColorArgb
+                axisLeft.gridColor = outlineColorArgb
             }
         },
         update = { chart ->
+            // テーマ切替（ダーク/ライト）にも追従させるため、色は毎回設定し直す
+            chart.xAxis.textColor = onSurfaceVariantColorArgb
+            chart.axisLeft.textColor = onSurfaceVariantColorArgb
+            chart.xAxis.gridColor = outlineColorArgb
+            chart.axisLeft.gridColor = outlineColorArgb
+            chart.setNoDataTextColor(onSurfaceVariantColorArgb)
             // --- 実績データ（青） ---
+            // sorted: 率計算・予測の起点は常に全実績が基準（表示期間フィルタとは独立させる）
             val sorted = records.sortedBy { it.dateEpochDays }
-            val actualEntries = sorted.map { r ->
+            val displayed = sorted.filter {
+                (range.start == null || it.dateEpochDays >= range.start) &&
+                    (range.end == null || it.dateEpochDays <= range.end)
+            }
+            val actualEntries = displayed.map { r ->
                 Entry(r.dateEpochDays.toFloat(), r.amount.toFloat())
             }
             val actualSet = LineDataSet(actualEntries, "実績").apply {
-                color = AndroidColor.BLUE
+                color = actualColorArgb
                 lineWidth = 2f
-                setDrawCircles(false)
+                // 表示範囲に実績が1点しか無いと折れ線は描けない（線は2点以上必要）ため、
+                // そのままだと何も見えなくなる。1点のときだけ丸を描いて視認できるようにする。
+                // デフォルトは円の中心に穴が開く(circle hole)仕様で、小さい半径だと塗りつぶしに
+                // 見えず視認しづらいため、穴なしの塗りつぶし丸にする。
+                setDrawCircles(actualEntries.size <= 1)
+                setDrawCircleHole(false)
+                setCircleColor(actualColorArgb)
+                circleRadius = 5f
                 setDrawValues(false)
                 this.mode = LineDataSet.Mode.LINEAR   // ← ここを this.mode に
             }
@@ -1296,7 +1499,13 @@ fun AssetChartSection(
                 d.year * 100 + d.monthValue
             }.size
 
-            val dataSets: MutableList<ILineDataSet> = mutableListOf(actualSet)
+            // ミニマップで予測区間だけを選ぶと表示範囲内の実績が0件になる。空のDataSetを混ぜると
+            // MPAndroidChartのmin/max計算が崩れるため、実績が無い時は予測線だけで描く。
+            val dataSets: MutableList<ILineDataSet> =
+                if (actualEntries.isEmpty()) mutableListOf() else mutableListOf(actualSet)
+            // 予測線の末尾X座標。range.endがnull（プリセット等で末尾まで表示）の時に
+            // X軸の表示上限として使う（下のfitScreen前のaxisMaximum設定で参照）。
+            var forecastEndX: Float? = null
 
 // 予測線の作成ブロックだけ差し替え
             if (monthCount >= 1 && forecastMonths > 0) {
@@ -1308,7 +1517,7 @@ fun AssetChartSection(
                 val monthlyAdd = (customDeltaPerMonth ?: 0L).toDouble()
 
                 val last = sorted.lastOrNull()
-                val forecastEntries =
+                val forecastEntriesRaw =
                     if (last != null) {
                         val startDate = LocalDate.ofEpochDay(last.dateEpochDays.toLong())
                         val list = ArrayList<Entry>(forecastMonths)
@@ -1327,11 +1536,16 @@ fun AssetChartSection(
                         }
                         list
                     } else emptyList()
+                // 予測線も表示範囲で切る（range.end == null なら末尾まで表示）。
+                val forecastEntries = forecastEntriesRaw.filter {
+                    (range.start == null || it.x >= range.start.toFloat()) &&
+                        (range.end == null || it.x <= range.end.toFloat())
+                }
+                forecastEndX = forecastEntries.lastOrNull()?.x
 
                 if (forecastEntries.isNotEmpty()) {
                     val forecastSet = LineDataSet(forecastEntries, "予測").apply {
-                        val orange = AndroidColor.rgb(255, 165, 0)
-                        color = orange                      // ▼ 線を緑に
+                        color = forecastColorArgb
                         setDrawCircles(false)         // 丸を描かない
                         lineWidth = 2f
                         setDrawValues(false)
@@ -1339,40 +1553,29 @@ fun AssetChartSection(
                     }
                     dataSets += forecastSet
                 }
-                chart.legend.resetCustom()
+                hasForecast = forecastEntries.isNotEmpty()
             } else {
-                // ★ 月が1つしかない → 予測線は描かず、凡例だけメッセージ表示
-                val blue = AndroidColor.BLUE
-                val orange = AndroidColor.rgb(255, 165, 0)
-
-
-                val legend = chart.legend
-                val entries = mutableListOf<com.github.mikephil.charting.components.LegendEntry>()
-
-                // 実績（青）
-                entries += com.github.mikephil.charting.components.LegendEntry().apply {
-                    label = "実績"
-                    formColor = blue
-                    form = com.github.mikephil.charting.components.Legend.LegendForm.LINE
-                }
-                // メッセージ（オレンジ）
-                entries += com.github.mikephil.charting.components.LegendEntry().apply {
-                    label = "-"
-                    formColor = orange
-                    form = com.github.mikephil.charting.components.Legend.LegendForm.LINE
-                }
-                legend.setCustom(entries)
+                // 月が1つしかない等で予測線を描けない場合はバッジも出さない
+                hasForecast = false
             }
 
-            chart.data = LineData(dataSets)
+            // 表示範囲（ミニマップのズーム等）に実績も予測も1件も入らない場合、
+            // 空のLineDataを渡すとグラフが何も描かれないまま残り「消えた」ように見えてしまう。
+            // その場合はdataをnullにしてsetNoDataTextのメッセージを出す。
+            chart.data = if (dataSets.isEmpty()) null else LineData(dataSets)
+            chart.invalidate()
             // 値選択リスナーを設定（ここがポイント）
             chart.setOnChartValueSelectedListener(object : OnChartValueSelectedListener {
                 override fun onValueSelected(e: Entry?, h: Highlight?) {
                     // x は epochDay を float にしたもの
                     val epochDays = e?.x?.toLong()?.toInt()
+                    // 実績が範囲外だと予測線がindex 0になるため、indexではなくラベルで判定する
+                    val isForecast = h?.let { chart.data?.getDataSetByIndex(it.dataSetIndex)?.label } == "予測"
+                    selectedPoint = e?.let { SelectedChartPoint(it.x.toLong(), it.y.toLong(), isForecast) }
                     onPointSelected(epochDays)
                 }
                 override fun onNothingSelected() {
+                    selectedPoint = null
                     onPointSelected(null)
                 }
             })
@@ -1395,15 +1598,375 @@ fun AssetChartSection(
 
 // Y軸: 上側に余白（%）を追加して上端の点が切れないように
             chart.axisLeft.spaceTop = 25f   // 10〜20 の範囲でお好み
-// ▼ 初期ハイライト：最新の実績を選択状態にする
+// ▼ 初期ハイライト：最新の実績を選択状態にする（表示範囲内にある時だけ）
             initialHighlightEpochDays?.let { epoch ->
-                chart.highlightValue(epoch.toFloat(), 0, true)
+                if (displayed.any { it.dateEpochDays == epoch }) {
+                    chart.highlightValue(epoch.toFloat(), 0, true)
+                }
+            }
+            // 表示範囲（ミニマップナビゲーターの選択）が変わった時だけビューをリセットする。
+            // 無関係な再コンポジションで毎回呼ぶと、ユーザーのピンチズーム/パン操作が意図せずリセットされてしまう。
+            val rangeKey = range.start to range.end
+            if (lastRangeKey.value != rangeKey) {
+                // fitScreen()はxAxisのaxisMinimum/axisMaximumに対してズーム・パンの変換行列を
+                // リセットするだけだが、axisMinimum/axisMaximumを明示設定していないとMPAndroidChartは
+                // 「現在のdataSetの実際のデータ範囲」から自動計算してしまう。これだと、range指定で
+                // 広い期間を要求していても、その範囲内の実績が疎（例:1点だけ）だとグラフがその1点
+                // 付近だけに縮んで表示され、「データが消えた」ように見えるバグになる。
+                // range（ユーザーが選んだ表示期間）をX軸の範囲として明示的に設定してからリセットする。
+                val xMin = range.start?.toFloat() ?: sorted.firstOrNull()?.dateEpochDays?.toFloat()
+                val xMax = range.end?.toFloat() ?: forecastEndX ?: sorted.lastOrNull()?.dateEpochDays?.toFloat()
+                if (xMin != null && xMax != null && xMax > xMin) {
+                    chart.xAxis.axisMinimum = xMin
+                    chart.xAxis.axisMaximum = xMax
+                } else {
+                    chart.xAxis.resetAxisMinimum()
+                    chart.xAxis.resetAxisMaximum()
+                }
+                chart.fitScreen()
+                lastRangeKey.value = rangeKey
             }
 // （任意）凡例が近い場合の回避
             chart.invalidate()
         }
     )
+    }
 }
+
+// 「実績」「予測」の凡例バッジ。表のタイトルのような、色付き枠線＋同色文字の小さなラベル。
+@Composable
+private fun ChartSeriesBadge(text: String, color: ComposeColor, modifier: Modifier = Modifier) {
+    Box(
+        modifier
+            .border(1.dp, color, RoundedCornerShape(6.dp))
+            .background(color.copy(alpha = 0.12f), RoundedCornerShape(6.dp))
+            .padding(horizontal = 8.dp, vertical = 2.dp)
+    ) {
+        Text(
+            text = text,
+            color = color,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Bold
+        )
+    }
+}
+
+// 差分（増減額）の文字色。初期色は日本の慣習どおりプラス＝赤、マイナス＝青で、設定の「カラー」で変更できる。
+// ダーク/ライトの出し分けはAssetforecastTheme側（LocalSeriesColors）で済んでいる。±0はグレー。
+@Composable
+private fun diffColor(diff: Long): ComposeColor {
+    val colors = LocalSeriesColors.current
+    return when {
+        diff > 0 -> colors.gain
+        diff < 0 -> colors.loss
+        else -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+    }
+}
+
+// 表示期間内の実績から「差分平均（円/回）」と「期間増減率」を求めた結果
+private data class RangeStats(val fromEpochDays: Int, val toEpochDays: Int, val avgDiff: Long, val changeRate: Double)
+
+// 一覧の「差分」列（前回記録との差）と同じ基準にするため、期間直前の記録を起点（base）とする。
+// こうすると avgDiff＝期間内の差分列の平均、changeRate＝base→期間末の変化率 と一致する。
+// 期間の先頭が全記録の先頭なら直前の記録が無いので、期間内の最初の記録を起点にする。
+private fun computeRangeStats(records: List<AssetRecord>, range: DisplayRange): RangeStats? {
+    val sorted = records.sortedBy { it.dateEpochDays }
+    val inRange = sorted.filter {
+        (range.start == null || it.dateEpochDays >= range.start) &&
+            (range.end == null || it.dateEpochDays <= range.end)
+    }
+    val first = inRange.firstOrNull() ?: return null
+    val last = inRange.last()
+    val prev = sorted.lastOrNull { it.dateEpochDays < first.dateEpochDays }
+    val base = prev ?: first
+    val steps = if (prev != null) inRange.size else inRange.size - 1
+    if (steps <= 0 || base.amount == 0L) return null
+    return RangeStats(
+        fromEpochDays = first.dateEpochDays,
+        toEpochDays = last.dateEpochDays,
+        avgDiff = (last.amount - base.amount) / steps,
+        changeRate = (last.amount - base.amount).toDouble() / base.amount
+    )
+}
+
+@Composable
+private fun RangeStatsStrip(records: List<AssetRecord>, range: DisplayRange, modifier: Modifier = Modifier) {
+    val stats = remember(records, range) { computeRangeStats(records, range) } ?: return
+    val ym = DateTimeFormatter.ofPattern("yyyy/MM")
+    val numberFont = com.journeygirl.assetforecast.ui.theme.NumberFontFamily
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val labelStyle = MaterialTheme.typography.labelSmall
+    Row(
+        modifier,
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = LocalDate.ofEpochDay(stats.fromEpochDays.toLong()).format(ym) + "〜" +
+                LocalDate.ofEpochDay(stats.toEpochDays.toLong()).format(ym),
+            style = labelStyle, color = muted, fontFamily = numberFont, maxLines = 1
+        )
+        Spacer(Modifier.width(10.dp))
+        Text("差分平均", style = labelStyle, color = muted, maxLines = 1)
+        Spacer(Modifier.width(4.dp))
+        Text(
+            text = formatYenSigned(stats.avgDiff),
+            style = labelStyle, color = diffColor(stats.avgDiff), fontFamily = numberFont, maxLines = 1
+        )
+        Spacer(Modifier.width(10.dp))
+        Text("増減率", style = labelStyle, color = muted, maxLines = 1)
+        Spacer(Modifier.width(4.dp))
+        val pct = stats.changeRate * 100.0
+        Text(
+            text = (if (pct > 0) "+" else "") + String.format(java.util.Locale.US, "%.1f%%", pct),
+            style = labelStyle,
+            // 色は符号で決める（小数1桁で0.0%に丸まる微小な増減でも向きが分かるように）
+            color = diffColor(if (pct > 0) 1 else if (pct < 0) -1 else 0),
+            fontFamily = numberFont, maxLines = 1
+        )
+    }
+}
+
+// グラフで選択中の点（x=epochDays, y=金額）。予測線上の点かどうかで表示色を変える。
+private data class SelectedChartPoint(val epochDays: Long, val amount: Long, val isForecast: Boolean)
+
+// バッジ行の中央に出す選択中の点の読み取り表示。証券アプリの価格表示風に、
+// 日付は控えめな小さい文字、金額は系列色の太い等幅数字にして桁が揃って見えるようにする。
+@Composable
+private fun SelectedPointReadout(point: SelectedChartPoint, color: ComposeColor, modifier: Modifier = Modifier) {
+    val date = LocalDate.ofEpochDay(point.epochDays).format(DateTimeFormatter.ofPattern("yyyy/MM/dd"))
+    // すぐ上のミニマップの集計行（期間・差分平均・増減率）と混ざって見えないよう、
+    // 系列色の淡い塗り＋枠のカプセルで囲み、金額も一回り大きくして「今選んでいる値」だと分かるようにする。
+    val shape = RoundedCornerShape(percent = 50)
+    Row(
+        modifier
+            .background(color.copy(alpha = 0.12f), shape)
+            .border(1.dp, color.copy(alpha = 0.35f), shape)
+            .padding(horizontal = 12.dp, vertical = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Text(
+            text = date,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.labelMedium,
+            fontFamily = com.journeygirl.assetforecast.ui.theme.NumberFontFamily,
+            modifier = Modifier.alignByBaseline()
+        )
+        Text(
+            text = "¥" + formatYen(point.amount),
+            color = color,
+            style = MaterialTheme.typography.titleMedium.copy(fontSize = 20.sp),
+            fontFamily = com.journeygirl.assetforecast.ui.theme.NumberFontFamily,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+            modifier = Modifier.alignByBaseline()
+        )
+    }
+}
+
+// グラフ下に全期間（実績＋予測）の簡易推移を描き、現在の表示範囲（DisplayRange）をハイライト枠で示すナビゲーター。
+// ハイライト枠の中央をドラッグすると範囲全体をシフト、左右端のハンドルをドラッグすると個別にリサイズできる。
+// 枠が全期間の端に達した側はDisplayRangeのstart/endをnullにして、AssetChartSection側の「予測線は末尾まで表示」挙動を保つ。
+@Composable
+private fun MiniMapNavigator(
+    records: List<AssetRecord>,
+    forecasts: List<ForecastPoint>,
+    range: DisplayRange,
+    onRangeChange: (DisplayRange) -> Unit,
+    selectedEpochDays: Int? = null,
+    modifier: Modifier = Modifier
+) {
+    val sorted = remember(records) { records.sortedBy { it.dateEpochDays } }
+    val fullStart = sorted.firstOrNull()?.dateEpochDays
+    // 右端は予測の末尾まで広げる（予測が無い時は実績の末尾）
+    val fullEnd = forecasts.lastOrNull()?.epochDays ?: sorted.lastOrNull()?.dateEpochDays
+
+    if (fullStart == null || fullEnd == null || fullEnd <= fullStart) {
+        return
+    }
+
+    val density = LocalDensity.current
+    // 背景の簡易推移線はメイングラフの実績線・予測線と同じ色で統一する
+    val backgroundLineColor = LocalSeriesColors.current.actual
+    val forecastLineColor = LocalSeriesColors.current.forecast
+    var widthPx by remember { mutableStateOf(0f) }
+    val fullSpan = (fullEnd - fullStart).toFloat()
+    // ミニマップは全期間（数年）を狭い横幅に凝縮しているため、わずかな指の移動でも
+    // 大きな日数変化になる。記録は月次が基本なので、下限を短くしすぎると実績データが
+    // 1件も入らない範囲までズームでき、グラフが実質空になって「消えた」ように見えてしまう。
+    // 必ず数ヶ月分のデータが入る粒度に制限する。
+    val minRangeDays = 90
+
+    val highlightStart = range.start ?: fullStart
+    val highlightEnd = range.end ?: fullEnd
+
+    // detectDragGestures のコールバック内から常に最新のハイライト範囲／コールバックを参照するため
+    val currentHighlight by rememberUpdatedState(highlightStart to highlightEnd)
+    val currentOnRangeChange by rememberUpdatedState(onRangeChange)
+
+    fun emitRange(newStart: Int, newEnd: Int) {
+        currentOnRangeChange(
+            DisplayRange(
+                start = if (newStart <= fullStart) null else newStart,
+                end = if (newEnd >= fullEnd) null else newEnd
+            )
+        )
+    }
+
+    // 縦軸は実績・予測を合わせた最小〜最大で正規化する（切り崩しで予測が実績を下回る場合もあるため両方見る）
+    val minAmount = minOf(sorted.minOf { it.amount }, forecasts.minOfOrNull { it.amount } ?: Long.MAX_VALUE)
+    val maxAmount = maxOf(sorted.maxOf { it.amount }, forecasts.maxOfOrNull { it.amount } ?: Long.MIN_VALUE)
+    val amountSpan = (maxAmount - minAmount).coerceAtLeast(1)
+
+    val handleWidthDp = 40.dp
+    val handleWidthPx = with(density) { handleWidthDp.toPx() }
+
+    // records（＝全期間の範囲）が変わった時だけジェスチャー検出コルーチンを作り直す。
+    // widthPxをキーに含めると、ドラッグ中のレイアウト再計算で値がわずかに変動するたびに
+    // コルーチンが再構築されてしまい、ドラッグが実質的に効かなくなる（widthPx自体は
+    // varなのでブロック内で都度読み直せば最新値が得られ、キーにする必要はない）。
+    val gestureKey = fullStart to fullEnd
+
+    Box(
+        modifier
+            .height(56.dp)
+            .onSizeChanged { widthPx = it.width.toFloat() }
+    ) {
+        // 背景：全期間の簡易推移（薄い色の折れ線。実績＝ブルー、予測＝グリーン）
+        Canvas(Modifier.fillMaxSize()) {
+            if (size.width > 0f) {
+                fun xOf(epochDays: Int) = size.width * (epochDays - fullStart) / fullSpan
+                fun yOf(amount: Long) = size.height * (1f - (amount - minAmount).toFloat() / amountSpan)
+                val stroke = androidx.compose.ui.graphics.drawscope.Stroke(width = 2.dp.toPx())
+                if (sorted.size >= 2) {
+                    val path = androidx.compose.ui.graphics.Path()
+                    sorted.forEachIndexed { i, r ->
+                        if (i == 0) path.moveTo(xOf(r.dateEpochDays), yOf(r.amount))
+                        else path.lineTo(xOf(r.dateEpochDays), yOf(r.amount))
+                    }
+                    drawPath(path = path, color = backgroundLineColor.copy(alpha = 0.5f), style = stroke)
+                }
+                if (forecasts.isNotEmpty()) {
+                    // 実績の最終点から繋げて描き、実績線と予測線の間に切れ目が出ないようにする
+                    val last = sorted.last()
+                    val path = androidx.compose.ui.graphics.Path()
+                    path.moveTo(xOf(last.dateEpochDays), yOf(last.amount))
+                    forecasts.forEach { f -> path.lineTo(xOf(f.epochDays), yOf(f.amount)) }
+                    drawPath(path = path, color = forecastLineColor.copy(alpha = 0.5f), style = stroke)
+                }
+            }
+        }
+
+        if (widthPx > 0f) {
+            val startPx = widthPx * (highlightStart - fullStart) / fullSpan
+            val endPx = widthPx * (highlightEnd - fullStart) / fullSpan
+
+            // ハイライト枠（中央をドラッグすると範囲全体をシフト）
+            Box(
+                Modifier
+                    .offset { IntOffset(startPx.roundToInt(), 0) }
+                    .width(with(density) { (endPx - startPx).coerceAtLeast(0f).toDp() })
+                    .fillMaxHeight()
+                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.15f))
+                    .border(1.dp, MaterialTheme.colorScheme.primary)
+                    .pointerInput(gestureKey) {
+                        detectDragGestures { change, dragAmount ->
+                            change.consume()
+                            if (widthPx <= 0f) return@detectDragGestures
+                            val (hs, he) = currentHighlight
+                            val deltaEpoch = (dragAmount.x / widthPx * fullSpan).roundToInt()
+                            val width = he - hs
+                            var newStart = hs + deltaEpoch
+                            var newEnd = he + deltaEpoch
+                            if (newStart < fullStart) {
+                                newStart = fullStart
+                                newEnd = fullStart + width
+                            }
+                            if (newEnd > fullEnd) {
+                                newEnd = fullEnd
+                                newStart = fullEnd - width
+                            }
+                            emitRange(newStart, newEnd)
+                        }
+                    }
+            )
+
+            // 左ハンドル（開始位置のリサイズ）
+            Box(
+                Modifier
+                    .offset { IntOffset((startPx - handleWidthPx / 2).roundToInt(), 0) }
+                    .width(handleWidthDp)
+                    .fillMaxHeight()
+                    .pointerInput(gestureKey) {
+                        detectDragGestures { change, dragAmount ->
+                            change.consume()
+                            if (widthPx <= 0f) return@detectDragGestures
+                            val (hs, he) = currentHighlight
+                            val deltaEpoch = (dragAmount.x / widthPx * fullSpan).roundToInt()
+                            // he-minRangeDaysがfullStartを下回り得る（heがfullStartに極めて近い場合）ため、
+                            // coerceInの上限がfullStart未満にならないようクランプしてから使う
+                            val upperBound = (he - minRangeDays).coerceAtLeast(fullStart)
+                            val newStart = (hs + deltaEpoch).coerceIn(fullStart, upperBound)
+                            emitRange(newStart, he)
+                        }
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Box(
+                    Modifier
+                        .width(4.dp)
+                        .fillMaxHeight(0.6f)
+                        .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(2.dp))
+                )
+            }
+
+            // 右ハンドル（終了位置のリサイズ）
+            Box(
+                Modifier
+                    .offset { IntOffset((endPx - handleWidthPx / 2).roundToInt(), 0) }
+                    .width(handleWidthDp)
+                    .fillMaxHeight()
+                    .pointerInput(gestureKey) {
+                        detectDragGestures { change, dragAmount ->
+                            change.consume()
+                            if (widthPx <= 0f) return@detectDragGestures
+                            val (hs, he) = currentHighlight
+                            val deltaEpoch = (dragAmount.x / widthPx * fullSpan).roundToInt()
+                            // hs+minRangeDaysがfullEndを上回り得る（hsがfullEndに極めて近い場合）ため、
+                            // coerceInの下限がfullEndを超えないようクランプしてから使う
+                            val lowerBound = (hs + minRangeDays).coerceAtMost(fullEnd)
+                            val newEnd = (he + deltaEpoch).coerceIn(lowerBound, fullEnd)
+                            emitRange(hs, newEnd)
+                        }
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Box(
+                    Modifier
+                        .width(4.dp)
+                        .fillMaxHeight(0.6f)
+                        .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(2.dp))
+                )
+            }
+
+            // グラフ（またはリスト）で選択中の記録の位置を、ミニマップ上に縦線で示す。
+            // ハイライト枠・ハンドルの後に描画することで最前面に重ね、ドラッグ操作とは独立した
+            // ただの目印（pointerInputを持たないのでタッチは奪わない）として扱う。
+            if (selectedEpochDays != null && selectedEpochDays in fullStart..fullEnd) {
+                val selectedPx = widthPx * (selectedEpochDays - fullStart) / fullSpan
+                val markerWidth = 2.dp
+                Box(
+                    Modifier
+                        .offset { IntOffset((selectedPx - with(density) { markerWidth.toPx() } / 2).roundToInt(), 0) }
+                        .width(markerWidth)
+                        .fillMaxHeight()
+                        .background(ComposeColor.Red.copy(alpha = 0.8f))
+                )
+            }
+        }
+    }
+}
+
 @Composable
 fun BannerAdView(modifier: Modifier = Modifier) {
     // いまどのプロバイダを表示しようとしているか
@@ -1497,8 +2060,8 @@ private fun RecordRow(
     val date = LocalDate.ofEpochDay(r.dateEpochDays.toLong())
     val basePaddingV = 2.dp  // ▼ 予測側と同じ 2.dp に統一
 
-    // 選択時の水色ハイライト
-    val targetColor = if (selected) ComposeColor(0xFFE3F2FD) else ComposeColor.Transparent
+    // 選択時のハイライト（ダーク/ライトどちらでも浮かないようテーマのprimaryをベースにする）
+    val targetColor = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f) else ComposeColor.Transparent
     val bg by animateColorAsState(targetValue = targetColor, label = "rowBg")
 
     Row(
@@ -1530,11 +2093,7 @@ private fun RecordRow(
         Text(
             text = formatYenSigned(diff),                 // 例: +¥10,000 / -¥5,000 / ±¥0
             style = MaterialTheme.typography.bodySmall,
-            color = when {
-                diff > 0 -> Color.Red          // プラス → 赤
-                diff < 0 -> Color.Blue         // マイナス → 青
-                else -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f) // ±0 → グレー
-            },
+            color = diffColor(diff),
             maxLines = 1,
             modifier = Modifier.weight(1f),
             textAlign = androidx.compose.ui.text.style.TextAlign.Center
@@ -1588,11 +2147,7 @@ private fun ForecastRow(p: ForecastPoint, diff: Long, addFixed: Long ) {
         Text(
             text = formatYenSigned(diff),
             style = MaterialTheme.typography.bodySmall,
-            color = when {
-                diff > 0 -> Color.Red          // プラス → 赤
-                diff < 0 -> Color.Blue         // マイナス → 青
-                else -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f) // ±0 → グレー
-            },
+            color = diffColor(diff),
             maxLines = 1,
             modifier = Modifier.weight(1f),
             textAlign = TextAlign.Center
@@ -1610,6 +2165,12 @@ private fun ForecastRow(p: ForecastPoint, diff: Long, addFixed: Long ) {
     }
     HorizontalDivider(thickness = 0.5.dp, color = grey.copy(alpha = 0.4f))
 }
+
+// グラフの表示期間プリセット（監視ダッシュボード風のタイムレンジセレクタ用）
+// グラフに表示するX軸範囲（epochDays）。start/endがnullなら無制限。
+// ミニマップナビゲーターのハイライト枠が全期間の端に達している側はnull（予測線は末尾まで表示）。
+// AssetChartSection（public）のパラメータ型として使うため可視性はpublicにする。
+data class DisplayRange(val start: Int?, val end: Int?)
 
 // 月ごとの平均資産額 → 月次増減率の平均を返す（直近 sampleMonths 分）
 // sampleMonths <= 0 なら全期間
@@ -1865,6 +2426,337 @@ private fun ForecastHeaderRow() {
 }
 
 
+private fun ForecastSettings.seriesColorChoices() =
+    SeriesColorChoices(gain = colorGain, loss = colorLoss, actual = colorActual, forecast = colorForecast)
+
+// ── 設定ダイアログの「カラー」セクション ──
+// 分かりやすさ優先の構成：
+//   1) 一括切り替え（日本式／欧米式）… 多くの人はこれだけで済む
+//   2) 4項目の行（項目名＋現在の色）… タップした1行だけがその場で開き、12色のプリセットを選べる
+//   3) プリセットに無い色は、開いた中の「自由に選ぶ」から色相・明るさの2本のスライダーで作る
+// 色はタップ（スライダーは指を離した時）の瞬間に保存・反映するので「保存」ボタンは不要。
+@Composable
+private fun SeriesColorSettings(
+    choices: SeriesColorChoices,
+    onChange: (SeriesColorChoices) -> Unit
+) {
+    val colors = LocalSeriesColors.current
+    var expandedSlot by remember { mutableStateOf<Int?>(null) }
+
+    fun isStyle(style: Pair<String, String>, defaultIsThis: Boolean): Boolean {
+        val gainOk = choices.gain == style.first || (defaultIsThis && choices.gain == null)
+        val lossOk = choices.loss == style.second || (defaultIsThis && choices.loss == null)
+        return gainOk && lossOk
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        // 1) 一括切り替え。▲▼をそれぞれの色で見せ、押すと何色になるかが文字を読まずに分かるようにする
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf(
+                Triple("日本式", JapaneseStyleChoices, true),
+                Triple("欧米式", WesternStyleChoices, false)
+            ).forEach { (name, style, isDefault) ->
+                val isDark = MaterialTheme.colorScheme.background.luminance() < 0.5f
+                val up = resolveColorChoice(style.first, isDark, colors.gain)
+                val down = resolveColorChoice(style.second, isDark, colors.loss)
+                FilterChip(
+                    selected = isStyle(style, isDefault),
+                    onClick = { onChange(choices.copy(gain = style.first, loss = style.second)) },
+                    label = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(name)
+                            Spacer(Modifier.width(6.dp))
+                            Text("▲", color = up)
+                            Text("▼", color = down)
+                        }
+                    }
+                )
+            }
+        }
+
+        // 2) 4項目。開けるのは常に1行だけにして、画面がごちゃつかないようにする
+        val slots = listOf(
+            Triple("増えた時", colors.gain, choices.gain),
+            Triple("減った時", colors.loss, choices.loss),
+            Triple("実績の線", colors.actual, choices.actual),
+            Triple("予測の線", colors.forecast, choices.forecast)
+        )
+        slots.forEachIndexed { index, (label, color, choice) ->
+            val expanded = expandedSlot == index
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable { expandedSlot = if (expanded) null else index }
+                    .padding(horizontal = 4.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                ColorSwatch(color = color, size = 22.dp)
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    if (expanded) "▲" else "▼",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            AnimatedVisibility(visible = expanded) {
+                ColorPalettePanel(
+                    choice = choice,
+                    currentColor = color,
+                    onPick = { picked ->
+                        onChange(
+                            when (index) {
+                                0 -> choices.copy(gain = picked)
+                                1 -> choices.copy(loss = picked)
+                                2 -> choices.copy(actual = picked)
+                                else -> choices.copy(forecast = picked)
+                            }
+                        )
+                    }
+                )
+            }
+        }
+    }
+}
+
+// 色見本の丸。背景と同化しないよう細い枠を付ける。
+@Composable
+private fun ColorSwatch(
+    color: ComposeColor,
+    size: androidx.compose.ui.unit.Dp,
+    selected: Boolean = false,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier
+            .size(size)
+            .border(
+                width = if (selected) 2.dp else 1.dp,
+                color = if (selected) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.outline,
+                shape = CircleShape
+            )
+            .padding(if (selected) 3.dp else 1.dp)
+            .background(color, CircleShape),
+        contentAlignment = Alignment.Center
+    ) {
+        if (selected) {
+            // 選択中の印。明るい色の上でも暗い色の上でも読めるよう、色の明るさで白/黒を切り替える
+            Text(
+                "✓",
+                color = if (color.luminance() > 0.5f) ComposeColor.Black else ComposeColor.White,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
+}
+
+// 1項目分の色選択パネル：12色のプリセット＋「自由に選ぶ」＋「初期色に戻す」
+@Composable
+private fun ColorPalettePanel(
+    choice: String?,
+    currentColor: ComposeColor,
+    onPick: (String?) -> Unit
+) {
+    val isDark = MaterialTheme.colorScheme.background.luminance() < 0.5f
+    var showCustom by remember { mutableStateOf(choice?.startsWith("c:") == true) }
+
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surfaceContainerHighest, RoundedCornerShape(12.dp))
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        ColorPresets.chunked(6).forEach { row ->
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                row.forEach { preset ->
+                    val id = presetChoice(preset.id)
+                    ColorSwatch(
+                        color = if (isDark) preset.dark else preset.light,
+                        size = 32.dp,
+                        selected = choice == id,
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .clickable { showCustom = false; onPick(id) }
+                    )
+                }
+            }
+        }
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            // 「自由に選ぶ」：虹色の丸で、プリセット以外の色を作れることが一目で分かるようにする
+            Row(
+                Modifier
+                    .clip(RoundedCornerShape(16.dp))
+                    .clickable { showCustom = !showCustom }
+                    .padding(horizontal = 4.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    Modifier
+                        .size(22.dp)
+                        .background(
+                            androidx.compose.ui.graphics.Brush.sweepGradient(rainbowColors()),
+                            CircleShape
+                        )
+                        .border(
+                            if (choice?.startsWith("c:") == true) 2.dp else 0.dp,
+                            MaterialTheme.colorScheme.onSurface,
+                            CircleShape
+                        )
+                )
+                Spacer(Modifier.width(6.dp))
+                Text("自由に選ぶ", style = MaterialTheme.typography.labelLarge)
+            }
+            Spacer(Modifier.weight(1f))
+            TextButton(onClick = { showCustom = false; onPick(null) }, enabled = choice != null) {
+                Text("初期色に戻す")
+            }
+        }
+        AnimatedVisibility(visible = showCustom) {
+            CustomColorPicker(initial = currentColor, onPicked = { onPick(customChoice(it)) })
+        }
+    }
+}
+
+private fun rainbowColors() = listOf(0f, 60f, 120f, 180f, 240f, 300f, 360f).map {
+    ComposeColor.hsv(it, 0.8f, 0.95f)
+}
+
+// 自由に色を作る：「色合い」と「明るさ」の2本だけ。彩度は見やすさ優先で固定する。
+// ドラッグ中はプレビューだけ更新し、指を離した時に保存（ドラッグ中に毎回保存しない）。
+@Composable
+private fun CustomColorPicker(initial: ComposeColor, onPicked: (ComposeColor) -> Unit) {
+    val hsv = remember(initial) {
+        FloatArray(3).also { android.graphics.Color.colorToHSV(initial.toArgb(), it) }
+    }
+    var hue by remember(initial) { mutableStateOf(hsv[0]) }
+    var value by remember(initial) { mutableStateOf(hsv[2].coerceIn(0.35f, 1f)) }
+    val saturation = 0.8f
+    val picked = ComposeColor.hsv(hue, saturation, value)
+
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text("色合い", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        GradientSlider(
+            value = hue / 360f,
+            onValueChange = { hue = it * 360f },
+            onValueChangeFinished = { onPicked(ComposeColor.hsv(hue, saturation, value)) },
+            brush = androidx.compose.ui.graphics.Brush.horizontalGradient(rainbowColors())
+        )
+        Text("明るさ", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        GradientSlider(
+            value = (value - 0.35f) / 0.65f,
+            onValueChange = { value = 0.35f + it * 0.65f },
+            onValueChangeFinished = { onPicked(ComposeColor.hsv(hue, saturation, value)) },
+            brush = androidx.compose.ui.graphics.Brush.horizontalGradient(
+                listOf(ComposeColor.hsv(hue, saturation, 0.35f), ComposeColor.hsv(hue, saturation, 1f))
+            )
+        )
+        // 自由色はダーク/ライト共通の1色になるため、両方の背景での見え方を並べて確認できるようにする
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf(
+                com.journeygirl.assetforecast.ui.theme.BgDark,
+                com.journeygirl.assetforecast.ui.theme.BgLight
+            ).forEach { bg ->
+                Box(
+                    Modifier
+                        .weight(1f)
+                        .background(bg, RoundedCornerShape(8.dp))
+                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(8.dp))
+                        .padding(vertical = 6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        "+¥12,345",
+                        color = picked,
+                        fontFamily = com.journeygirl.assetforecast.ui.theme.NumberFontFamily,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
+    }
+}
+
+// グラデーションの帯の上にスライダーを重ねたもの（帯で「どちらに動かすと何色になるか」を見せる）
+@Composable
+private fun GradientSlider(
+    value: Float,
+    onValueChange: (Float) -> Unit,
+    onValueChangeFinished: () -> Unit,
+    brush: androidx.compose.ui.graphics.Brush
+) {
+    Box(Modifier.fillMaxWidth().height(32.dp), contentAlignment = Alignment.Center) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp)
+                .height(10.dp)
+                .background(brush, RoundedCornerShape(5.dp))
+        )
+        Slider(
+            value = value,
+            onValueChange = onValueChange,
+            onValueChangeFinished = onValueChangeFinished,
+            colors = SliderDefaults.colors(
+                thumbColor = ComposeColor.White,
+                activeTrackColor = ComposeColor.Transparent,
+                inactiveTrackColor = ComposeColor.Transparent
+            ),
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+}
+
+// 設定ダイアログの数値入力欄。ダイアログ背景から浮くよう枠線（outline）と薄い塗り（surfaceContainerHighest）を付け、
+// 単位はラベルに混ぜずsuffixで入力値の右に出す（ラベルは短く、単位は常に見える位置に）。
+// ラベルは枠の外（上）に常時表示する。OutlinedTextFieldのlabelを使うと、空欄の時だけラベルが
+// 枠内に大きく表示されsuffixも隠れるため、入力済みの欄と見た目が揃わず分かりにくくなる。
+@Composable
+private fun SettingsField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    suffix: String? = null,
+    placeholder: String = "未設定",
+    supportingText: String? = null,
+    keyboardType: KeyboardType = KeyboardType.Number
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(start = 4.dp)
+        )
+        OutlinedTextField(
+            value = value,
+            onValueChange = onValueChange,
+            suffix = suffix?.let { { Text(it) } },
+            placeholder = { Text(placeholder) },
+            supportingText = supportingText?.let { { Text(it) } },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+            textStyle = MaterialTheme.typography.bodyLarge.copy(
+                fontFamily = com.journeygirl.assetforecast.ui.theme.NumberFontFamily
+            ),
+            shape = RoundedCornerShape(10.dp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = MaterialTheme.colorScheme.primary,
+                unfocusedBorderColor = MaterialTheme.colorScheme.outline,
+                focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                focusedSuffixColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                unfocusedSuffixColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                unfocusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                focusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+            ),
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+}
+
 @Composable
 private fun appTextFieldColors(): TextFieldColors =
     TextFieldDefaults.colors(
@@ -1879,80 +2771,6 @@ private fun appTextFieldColors(): TextFieldColors =
         disabledContainerColor = MaterialTheme.colorScheme.surface
     )
 
-
-// mm → px 変換
-private fun mmToPx(context: Context, mm: Float): Float =
-    mm * context.resources.displayMetrics.xdpi / 25.4f
-
-// テキストふきだし用の Marker
-private class TextMarker(
-    private val context: Context,
-    private val xFormatter: java.time.format.DateTimeFormatter,
-    private val yFormatter: (Float) -> String,
-    private val offsetLeftPx: Float = 0f,   // ← 追加：左方向へずらす量
-    private val offsetDownPx: Float = 0f    // ← 追加：下方向へずらす量
-) : com.github.mikephil.charting.components.IMarker {
-
-    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = AndroidColor.BLACK
-        textSize = context.resources.displayMetrics.scaledDensity * 12f
-    }
-    private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = AndroidColor.WHITE
-        style = Paint.Style.FILL
-    }
-    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = AndroidColor.DKGRAY
-        style = Paint.Style.STROKE
-        strokeWidth = context.resources.displayMetrics.density
-    }
-    private val padH = context.resources.displayMetrics.density * 6f
-    private val padV = context.resources.displayMetrics.density * 4f
-    private var label: String = ""
-
-    override fun refreshContent(e: Entry?, highlight: Highlight?) {
-        if (e == null) return
-        val d = java.time.LocalDate.ofEpochDay(e.x.toLong())
-        label = "${d.format(xFormatter)}  ${yFormatter(e.y)}"
-    }
-
-    override fun draw(canvas: Canvas, posX: Float, posY: Float) {
-        if (label.isEmpty()) return
-
-        // テキストサイズを測ってバッジの矩形を決定
-        val textW = textPaint.measureText(label)
-        val textH = textPaint.fontMetrics.let { it.descent - it.ascent }
-        val boxW = textW + padH * 2
-        val boxH = textH + padV * 2
-
-        // 画面外に出ないよう X をクランプ
-        val x = (posX - boxW / 2f).coerceAtLeast(0f)
-        val maxX = canvas.width - boxW
-        val boxX = x.coerceAtMost(maxX)
-
-        // “点の 2mm 左” に移動（xは左へオフセット）
-        val rawX = posX - boxW / 2f - offsetLeftPx
-
-        // “点の 2mm 下” に移動（yは下方向が正なのでオフセットを足す）
-        val rawY = posY + offsetDownPx
-        val boxY = rawY.coerceIn(0f, canvas.height - boxH)
-
-        val rect = android.graphics.RectF(boxX, boxY, boxX + boxW, boxY + boxH)
-        canvas.drawRoundRect(rect, 12f, 12f, bgPaint)
-        canvas.drawRoundRect(rect, 12f, 12f, stroke)
-
-        val textX = rect.left + padH
-        val textY = rect.top + padV - textPaint.fontMetrics.ascent
-        canvas.drawText(label, textX, textY, textPaint)
-    }
-
-    // 既定のオフセットは使わない（描画時に自前でずらしている）
-    override fun getOffset(): com.github.mikephil.charting.utils.MPPointF =
-        com.github.mikephil.charting.utils.MPPointF(0f, 0f)
-    override fun getOffsetForDrawingAtPoint(
-        posX: Float, posY: Float
-    ): com.github.mikephil.charting.utils.MPPointF = getOffset()
-}
 
 
 /** DatePickerDialog に “減光しっぱなし” 回避フックを仕込む */

@@ -12,6 +12,7 @@ import kotlinx.coroutines.launch
 import java.time.LocalDate
 import com.journeygirl.assetforecast.data.prefs.SettingsStore
 import com.journeygirl.assetforecast.data.prefs.ForecastSettings
+import com.journeygirl.assetforecast.data.prefs.DisplayRangePrefs
 import kotlinx.coroutines.flow.map
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.os.LocaleListCompat
@@ -28,6 +29,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     // ★ 追加：設定の State
     val settings = settingsStore.settingsFlow
         .stateIn(viewModelScope, SharingStarted.Eagerly, ForecastSettings())
+
+    // グラフのミニマップナビゲーターで選択中の表示範囲（アプリ再起動後も復元する）。
+    // 初期値はnull＝「DataStoreからまだ読み込んでいない」を表す。これをDisplayRangePrefs(null,null)
+    // （＝保存済みだが値が無い＝全期間）にしてしまうと、復元側が「初期値で確定」と誤判定して
+    // 実際の保存値のemitを無視してしまう（起動のたびに保存範囲が復元されないバグになる）。
+    val displayRange: kotlinx.coroutines.flow.StateFlow<DisplayRangePrefs?> = settingsStore.displayRangeFlow
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     fun addRecord(date: LocalDate, amount: Long, note: String?) {
         viewModelScope.launch {
@@ -59,6 +67,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun saveSettings(newSettings: ForecastSettings) {
         viewModelScope.launch {
             settingsStore.save(newSettings)
+        }
+    }
+    fun saveDisplayRange(start: Int?, end: Int?) {
+        viewModelScope.launch {
+            settingsStore.saveDisplayRange(start, end)
         }
     }
     fun applyLanguage(tag: String) {
