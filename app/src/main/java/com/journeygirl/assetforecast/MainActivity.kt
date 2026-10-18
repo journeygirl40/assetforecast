@@ -269,12 +269,17 @@ class MainActivity : ComponentActivity() {
             consentJob.join()
         }
 
-        // AdMob 初期化。完了を待たずに広告の読み込みを始めてよい（SDK側で待ち合わせる）
-        MobileAds.initialize(this) { adsReady = true }
-
-        // Unity Ads 初期化（AdMob で埋まらなかった時のバナー用）
-        runCatching {
-            com.unity3d.ads.UnityAds.initialize(this, AdsManager.UNITY_GAME_ID, AdsManager.unityTestMode(this))
+        // AdMob / Unity Ads 初期化。メインスレッドで行うと数秒画面が止まるため、裏のスレッドで行う
+        // （Google推奨）。完了を待たずに広告の読み込みを始めてよい（SDK側で待ち合わせる）
+        val appContext = applicationContext
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            MobileAds.initialize(this@MainActivity) {
+                lifecycleScope.launch { adsReady = true }
+            }
+            // Unity Ads（AdMob で埋まらなかった時のバナー用）
+            runCatching {
+                com.unity3d.ads.UnityAds.initialize(appContext, AdsManager.UNITY_GAME_ID, AdsManager.unityTestMode(appContext))
+            }
         }
 
         val adFree = vm.settings.value.adFree
