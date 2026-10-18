@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -7,16 +9,41 @@ plugins {
 }
 
 
+// リリース署名の情報はプロジェクト直下の keystore.properties（git管理外）から読む。
+// パスワードをビルドスクリプトやgitに残さないため。ファイルが無い/未記入なら署名なしでビルドされる。
+val keystoreProps = Properties().apply {
+    val f = rootProject.file("keystore.properties")
+    if (f.exists()) f.reader(Charsets.UTF_8).use { load(it) }  // パスやパスワードに日本語が含まれても読めるようUTF-8で読む
+}
+val hasReleaseKeystore = keystoreProps.getProperty("storeFile")?.let { file(it).exists() } == true
+
 android {
     namespace = "com.journeygirl.assetforecast"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.journeygirl.assetforecast"
         minSdk = 24
-        targetSdk = 35
-        versionCode = 20
-        versionName = "3.8"
+        targetSdk = 36  // Google Play: 2026/8/31以降のアップデートはAPI 36以上が必須
+        versionCode = 21
+        versionName = "3.9"
+    }
+
+    signingConfigs {
+        if (hasReleaseKeystore) {
+            create("release") {
+                storeFile = file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
+    }
+
+    buildTypes {
+        getByName("release") {
+            if (hasReleaseKeystore) signingConfig = signingConfigs.getByName("release")
+        }
     }
 
     buildFeatures { compose = true }
@@ -51,6 +78,8 @@ dependencies {
     // Lifecycle / ViewModel
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
+    implementation("androidx.lifecycle:lifecycle-process:2.8.6")   // アプリ起動広告：アプリが前面に戻ったことの検知
+    implementation("androidx.core:core-splashscreen:1.0.1")        // アプリ起動広告：起動中のスプラッシュ画面
 
     // Room
     implementation("androidx.room:room-runtime:2.6.1")

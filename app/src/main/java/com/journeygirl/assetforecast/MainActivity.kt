@@ -96,6 +96,9 @@ import android.widget.LinearLayout
 import android.widget.NumberPicker
 import android.view.Gravity
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.launch
+import androidx.lifecycle.lifecycleScope
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalDensity
 import android.graphics.*
@@ -146,8 +149,40 @@ import com.journeygirl.assetforecast.ads.AdProvider
 class MainActivity : ComponentActivity() {
     private val vm by viewModels<MainViewModel>()
 
+    // 広告SDKの初期化が終わったか（バナー・インタースティシャルの表示許可に使う）
+    private var adsReady by mutableStateOf(false)
+    // スプラッシュ画面を出し続けるか。アプリ起動広告を待つ間だけ true（最大でも約4秒）
+    private var keepSplash = true
+    private val adPrefs by lazy { getSharedPreferences("ads", MODE_PRIVATE) }
+
+    // アプリが裏から前面に戻った時のアプリ起動広告。
+    // 登録直後に現在の状態（起動済み）が通知されるので、最初の1回は無視する。
+    private var firstForegroundEventSkipped = false
+    private val appForegroundObserver = object : androidx.lifecycle.DefaultLifecycleObserver {
+        override fun onStart(owner: androidx.lifecycle.LifecycleOwner) {
+            if (!firstForegroundEventSkipped) { firstForegroundEventSkipped = true; return }
+            if (!adsReady || vm.settings.value.adFree) return
+            AdsManager.showAppOpenIfEligible(
+                activity = this@MainActivity,
+                isResume = true,
+                lastAppOpenWallMs = adPrefs.getLong(KEY_LAST_APP_OPEN, 0L),
+                onShown = { adPrefs.edit().putLong(KEY_LAST_APP_OPEN, System.currentTimeMillis()).apply() },
+                onDismiss = {}
+            )
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
+        // スプラッシュ画面（Android 12未満にも同じ見た目で出る）。super.onCreateより前に呼ぶ必要がある
+        val splash = installSplashScreen()
         super.onCreate(savedInstanceState)
+        splash.setKeepOnScreenCondition { keepSplash }
+        // 画面回転などで作り直された時は起動扱いにしない（起動広告はプロセスの最初の1回だけ）
+        val isColdStart = !coldStartHandled
+        coldStartHandled = true
+        if (!isColdStart) keepSplash = false
+        lifecycleScope.launch { startAds(isColdStart) }
+        androidx.lifecycle.ProcessLifecycleOwner.get().lifecycle.addObserver(appForegroundObserver)
 
         // ① コンテンツをシステムバーの下まで広げる（Edge-to-Edge）
         WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -178,49 +213,97 @@ class MainActivity : ComponentActivity() {
                     controller.isAppearanceLightNavigationBars = !darkTheme
                 }
 
-                var showAds by remember { mutableStateOf(false) }   // ← 広告表示トリガー
-                AppRoot(vm = vm, showAds = showAds)
+                AppRoot(vm = vm, showAds = adsReady)
+            }
+        }
+    }
 
-                // UI表示後に重い初期化を非同期で実行
-                LaunchedEffect(Unit) {
-                // UMP（同意管理）を非同期初期化
-                runCatching {
-                    val params = ConsentRequestParameters.Builder().build()
-                    val consentInfo = UserMessagingPlatform.getConsentInformation(this@MainActivity)
-                    suspendCancellableCoroutine<Unit> { cont ->
-                        consentInfo.requestConsentInfoUpdate(
-                            this@MainActivity, params,
-                            {
-                                if (consentInfo.isConsentFormAvailable) {
-                                    UserMessagingPlatform.loadConsentForm(
-                                        this@MainActivity,
-                                        { form -> form.show(this@MainActivity) { cont.resume(Unit) {} } },
-                                        { cont.resume(Unit) {} }
-                                    )
-                                } else cont.resume(Unit) {}
-                            },
-                            { cont.resume(Unit) {} }
-                        )
-                    }
-                }
+    override fun onDestroy() {
+        androidx.lifecycle.ProcessLifecycleOwner.get().lifecycle.removeObserver(appForegroundObserver)
+        super.onDestroy()
+    }
 
-                // AdMob を遅延初期化
+    // 広告まわりの初期化（同意確認 → AdMob/Unity初期化）と、起動時のアプリ起動広告。
+    // 起動広告はスプラッシュ画面の間（最大約4秒）に間に合った時だけ出し、間に合わなければ出さない。
+    private suspend fun startAds(isColdStart: Boolean) {
+        val splashDeadline = android.os.SystemClock.elapsedRealtime() + APP_OPEN_SPLASH_WAIT_MS
+        // 何があってもスプラッシュで止まり続けないための保険
+        lifecycleScope.launch { kotlinx.coroutines.delay(APP_OPEN_SPLASH_WAIT_MS + 500); keepSplash = false }
+
+        val launchCount = adPrefs.getInt(KEY_LAUNCH_COUNT, 0) + if (isColdStart) 1 else 0
+        if (isColdStart) adPrefs.edit().putInt(KEY_LAUNCH_COUNT, launchCount).apply()
+
+        // UMP（同意管理）。同意フォームは必要な人（未回答の地域のユーザー）にだけ出す。
+        // フォームを出した起動では、続けて起動広告まで出すと煩わしいので起動広告は出さない。
+        // 同意情報の更新は通信で2秒以上かかることがあり、待つと起動広告が3秒に間に合わないため、
+        // Google公式サンプルと同様に裏で並行して進め、前回までの同意状態で広告の準備を先に始める。
+        // 前回の時点で「同意が必要（未回答）」だった人だけは、フォームの結果を待ってから進める。
+        var consentFormShown = false
+        val consentInfo = UserMessagingPlatform.getConsentInformation(this)
+        val consentJob = lifecycleScope.launch {
+            runCatching {
                 suspendCancellableCoroutine<Unit> { cont ->
-                    MobileAds.initialize(this@MainActivity) { cont.resume(Unit) {} }
-                }
-
-                // ▼ 追加：Unity Ads 初期化（動作確認なので testMode=ON）
-                runCatching {
-                    com.unity3d.ads.UnityAds.initialize(
-                        this@MainActivity,
-                        com.journeygirl.assetforecast.ads.AdsManager.UNITY_GAME_ID,
-                        com.journeygirl.assetforecast.ads.AdsManager.UNITY_TEST_MODE
+                    consentInfo.requestConsentInfoUpdate(
+                        this@MainActivity, ConsentRequestParameters.Builder().build(),
+                        {
+                            if (consentInfo.consentStatus == ConsentInformation.ConsentStatus.REQUIRED) {
+                                consentFormShown = true
+                                keepSplash = false   // フォームはメイン画面の上に出す
+                            }
+                            UserMessagingPlatform.loadAndShowConsentFormIfRequired(this@MainActivity) { cont.resume(Unit) {} }
+                        },
+                        { cont.resume(Unit) {} }
                     )
-                }
-                showAds = true // ★これを追加（初期化が終わったら広告表示を許可）
                 }
             }
         }
+        if (consentInfo.consentStatus == ConsentInformation.ConsentStatus.REQUIRED) {
+            consentFormShown = true
+            keepSplash = false
+            consentJob.join()
+        }
+
+        // AdMob 初期化。完了を待たずに広告の読み込みを始めてよい（SDK側で待ち合わせる）
+        MobileAds.initialize(this) { adsReady = true }
+
+        // Unity Ads 初期化（AdMob で埋まらなかった時のバナー用）
+        runCatching {
+            com.unity3d.ads.UnityAds.initialize(this, AdsManager.UNITY_GAME_ID, AdsManager.unityTestMode(this))
+        }
+
+        val adFree = vm.settings.value.adFree
+        // 初回起動は出さない（最初の印象を広告にしない）
+        val wantAppOpen = isColdStart && launchCount >= 2 && !consentFormShown && !adFree
+        if (wantAppOpen) {
+            val remaining = splashDeadline - android.os.SystemClock.elapsedRealtime()
+            val loaded = remaining > 0 && kotlinx.coroutines.withTimeoutOrNull(remaining) {
+                suspendCancellableCoroutine<Boolean> { cont ->
+                    AdsManager.loadAppOpen(this@MainActivity) { ok -> if (cont.isActive) cont.resume(ok) {} }
+                }
+            } == true
+            // スプラッシュが既に消えていたら（時間切れ）出さない：メイン画面に突然かぶせない
+            if (loaded && keepSplash && !consentFormShown) {
+                AdsManager.showAppOpenIfEligible(
+                    activity = this,
+                    isResume = false,
+                    lastAppOpenWallMs = adPrefs.getLong(KEY_LAST_APP_OPEN, 0L),
+                    onShown = { adPrefs.edit().putLong(KEY_LAST_APP_OPEN, System.currentTimeMillis()).apply() },
+                    onDismiss = {}
+                )
+            }
+        } else if (!adFree) {
+            AdsManager.loadAppOpen(this)   // 裏から戻ってきた時用に先読み
+        }
+        keepSplash = false
+    }
+
+    companion object {
+        // 起動広告をスプラッシュ画面で待つ最長時間。長くするほど表示機会は増えるが起動が遅く感じられる
+        private const val APP_OPEN_SPLASH_WAIT_MS = 4000L
+        private const val KEY_LAUNCH_COUNT = "launch_count"
+        private const val KEY_LAST_APP_OPEN = "last_app_open_wall_ms"
+        // プロセス内で起動時の処理を済ませたか（画面回転などによる作り直しと本当の起動を区別する）
+        private var coldStartHandled = false
     }
 }
 
@@ -666,12 +749,28 @@ fun AppRoot(
             }
         }
     }
+    // ── インタースティシャル広告 ──
+    // 広告SDKの初期化が終わったら1枚先読みしておき、記録の追加・編集を保存した直後（操作の区切り）に
+    // 頻度上限付きで表示する（上限や読み込み状況の判定は AdsManager.maybeShowInterstitial 側）。
+    val adActivity = remember(context) { context.findActivity() }
+    LaunchedEffect(showAds, settings.adFree) {
+        if (showAds && !settings.adFree) {
+            com.journeygirl.assetforecast.ads.AdsManager.preloadInterstitial(context)
+        }
+    }
+    fun maybeShowInterstitialAfterSave() {
+        if (showAds && !settings.adFree && adActivity != null) {
+            com.journeygirl.assetforecast.ads.AdsManager.maybeShowInterstitial(adActivity)
+        }
+    }
+
     if (showAdd) {
         AddDialog(
             onDismiss = { showAdd = false },
             onSubmit = { date, amount, note ->
                 vm.addRecord(date, amount, note)
                 showAdd = false
+                maybeShowInterstitialAfterSave()
             }
         )
     }
@@ -683,6 +782,7 @@ fun AppRoot(
                 vm.updateRecord(target.id, date, amount, note)
                 editing = null
                 selectedId = null
+                maybeShowInterstitialAfterSave()
             },
             onDelete = {
                 vm.deleteRecord(target)
@@ -2812,4 +2912,11 @@ private fun View.findAllNumberPickers(): List<NumberPicker> {
     }
     dfs(this)
     return out
+}
+
+// Compose の LocalContext は ContextWrapper で包まれていることがあるため、Activity まで辿って取り出す
+private tailrec fun android.content.Context.findActivity(): android.app.Activity? = when (this) {
+    is android.app.Activity -> this
+    is android.content.ContextWrapper -> baseContext.findActivity()
+    else -> null
 }

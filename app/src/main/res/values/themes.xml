@@ -3,4 +3,12 @@
     <style name="Theme.AssetForecast" parent="Theme.Material3.DayNight.NoActionBar">
         <!-- 余計な指定は一旦なし -->
     </style>
+
+    <!-- 起動時のスプラッシュ画面。アプリ起動広告はこの画面の間だけ待ち、間に合わなければ出さない
+         （メイン画面の表示後に広告が突然かぶさるのを防ぐ）。表示後は Theme.AssetForecast に切り替わる -->
+    <style name="Theme.AssetForecast.Starting" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/splash_background</item>
+        <item name="windowSplashScreenAnimatedIcon">@mipmap/ic_launcher</item>
+        <item name="postSplashScreenTheme">@style/Theme.AssetForecast</item>
+    </style>
 </resources>
