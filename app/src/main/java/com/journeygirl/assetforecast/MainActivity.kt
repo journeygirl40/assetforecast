@@ -29,6 +29,9 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.journeygirl.assetforecast.data.db.AssetRecord
 import com.journeygirl.assetforecast.data.prefs.ForecastSettings
+import com.journeygirl.assetforecast.data.prefs.ExpenseRepeat
+import com.journeygirl.assetforecast.data.prefs.ScheduledExpense
+import com.journeygirl.assetforecast.data.prefs.netFor
 import com.journeygirl.assetforecast.viewmodel.MainViewModel
 import com.github.mikephil.charting.charts.LineChart
 import com.github.mikephil.charting.components.XAxis
@@ -100,6 +103,8 @@ import kotlinx.coroutines.launch
 import androidx.lifecycle.lifecycleScope
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.platform.LocalDensity
 import android.graphics.*
 import com.github.mikephil.charting.components.IMarker
@@ -161,6 +166,7 @@ class MainActivity : ComponentActivity() {
     private val appForegroundObserver = object : androidx.lifecycle.DefaultLifecycleObserver {
         override fun onStart(owner: androidx.lifecycle.LifecycleOwner) {
             if (!firstForegroundEventSkipped) { firstForegroundEventSkipped = true; return }
+            if (AdsManager.skipNextResumeAppOpen) { AdsManager.skipNextResumeAppOpen = false; return }
             if (!adsReady || vm.settings.value.adFree) return
             AdsManager.showAppOpenIfEligible(
                 activity = this@MainActivity,
@@ -323,13 +329,20 @@ fun AppRoot(
     var settingsOffsetX by remember { mutableStateOf(0f) }
     var settingsOffsetY by remember { mutableStateOf(-130f) }
 
-    val settings by vm.settings.collectAsState()
+    val loadedSettings by vm.loadedSettings.collectAsState()
+    val settings = loadedSettings ?: vm.settings.value
+    val settingsLoaded = loadedSettings != null
     LaunchedEffect(settings.language) { vm.applyLanguage(settings.language) }
     val records by vm.records.collectAsState()
     var editing by remember { mutableStateOf<AssetRecord?>(null) }
 
     var showAdd by remember { mutableStateOf(false) }
     var selectedId by remember { mutableStateOf<Long?>(null) }   // ← AssetRecord.id が Int の想定
+    // 選択中の予測点の日付（予測は記録ではなくidが無いので日付で持つ）。実績の選択(selectedId)とはどちらか一方だけ
+    var selectedForecastEpoch by remember { mutableStateOf<Int?>(null) }
+    // リストで選んだ点をグラフにも反映するための依頼（同じ点を選び直しても反映されるよう連番を持たせる）
+    var chartHighlightRequest by remember { mutableStateOf<ChartHighlightRequest?>(null) }
+    var chartHighlightSeq by remember { mutableStateOf(0L) }
     var selectionSource by remember { mutableStateOf<SelectionSource?>(null) }
     val listState = rememberLazyListState()
 
@@ -367,98 +380,77 @@ fun AppRoot(
 
     val context = androidx.compose.ui.platform.LocalContext.current
 
-    fun recordsToCsv(rows: List<AssetRecord>): String {
-        val sb = StringBuilder()
-        sb.appendLine("date,amount,note")
-        rows.sortedBy { it.dateEpochDays }.forEach { r ->
-            val date = LocalDate.ofEpochDay(r.dateEpochDays.toLong()).format(DATE_FMT)
-            val amount = r.amount.toString() // カンマ無し
-            val note = r.note?.replace("\"", "\"\"") ?: ""
-            // C列はカンマを含む可能性があるのでダブルクォートで囲む
-            sb.append(date).append(",")
-                .append(amount).append(",")
-                .append("\"").append(note).append("\"")
-                .appendLine()
-        }
-        return sb.toString()
-    }
-
-    fun parseCsvLine(line: String): List<String> {
-        // かんたんRFC4180対応（"で囲まれたカンマ、""のエスケープ対応）
-        val out = mutableListOf<String>()
-        var cur = StringBuilder()
-        var inQuotes = false
-        var i = 0
-        while (i < line.length) {
-            val ch = line[i]
-            if (ch == '\"') {
-                if (inQuotes && i + 1 < line.length && line[i + 1] == '\"') {
-                    cur.append('\"') // エスケープ
-                    i += 2
-                    continue
-                } else {
-                    inQuotes = !inQuotes
-                }
-            } else if (ch == ',' && !inQuotes) {
-                out += cur.toString()
-                cur = StringBuilder()
-            } else {
-                cur.append(ch)
-            }
-            i++
-        }
-        out += cur.toString()
-        return out
-    }
-
     // --- エクスポート launcher ---
+    // 記録・定期的な収支・設定を1つのCSVに書き出す（形式は data/backup/BackupCsv.kt）
     val exportLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("text/csv")
     ) { uri: Uri? ->
         if (uri != null) {
-            runCatching {
+            val ok = runCatching {
                 context.contentResolver.openOutputStream(uri)?.use { os ->
                     OutputStreamWriter(os, Charsets.UTF_8).use { w ->
-                        w.write(recordsToCsv(vm.records.value))
+                        w.write(
+                            com.journeygirl.assetforecast.data.backup.buildBackupCsv(
+                                records = vm.records.value,
+                                scheduled = vm.scheduledExpenses.value,
+                                settings = vm.settings.value
+                            )
+                        )
                     }
                 }
-            }
+            }.isSuccess
+            android.widget.Toast.makeText(
+                context, if (ok) "書き出しました" else "書き出しに失敗しました", android.widget.Toast.LENGTH_SHORT
+            ).show()
         }
     }
 
     // --- インポート launcher ---
+    // 旧形式（記録だけ）のCSVも読める。すでにある記録・収支と同じものは追加しない
     val importLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
-            runCatching {
+            val text = runCatching {
                 context.contentResolver.openInputStream(uri)?.use { ins ->
-                    BufferedReader(InputStreamReader(ins, Charsets.UTF_8)).use { br ->
-                        var first = true
-                        br.lineSequence().forEach { line ->
-                            if (line.isBlank()) return@forEach
-                            // ヘッダー行は飛ばす
-                            if (first && line.lowercase().startsWith("date,amount")) {
-                                first = false
-                                return@forEach
-                            }
-                            first = false
-                            val cols = parseCsvLine(line)
-                            if (cols.size >= 2) {
-                                val date = parseDateOrNull(cols[0]) ?: return@forEach
-                                val amount = cols[1].trim().toLongOrNull() ?: return@forEach
-                                val note = cols.getOrNull(2)?.replace("\"\"", "\"")?.trim('"')?.ifBlank { null }
-                                vm.addRecord(date, amount, note)
-                            }
-                        }
+                    BufferedReader(InputStreamReader(ins, Charsets.UTF_8)).use { it.readText() }
+                }
+            }.getOrNull()
+            if (text == null) {
+                android.widget.Toast.makeText(context, "読み込みに失敗しました", android.widget.Toast.LENGTH_SHORT).show()
+            } else {
+                val data = com.journeygirl.assetforecast.data.backup.parseBackupCsv(text, vm.settings.value)
+                vm.importBackup(data) { r ->
+                    val parts = buildList {
+                        if (r.addedRecords > 0) add("記録 ${r.addedRecords}件")
+                        if (r.addedScheduled > 0) add("定期的な収支 ${r.addedScheduled}件")
                     }
+                    val added = if (parts.isEmpty()) "新しい記録・収支はありませんでした（すべて登録済み）"
+                    else parts.joinToString("・") + "を追加しました"
+                    val msg = added + (if (r.settingsApplied) "\n設定を読み込みました" else "")
+                    android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_LONG).show()
                 }
             }
         }
     }
 
 
-    LaunchedEffect(selectedId, records, selectionSource) {
+    val scheduledExpenses by vm.scheduledExpenses.collectAsState()
+    val forecasts = remember(records, settings, scheduledExpenses) {
+        buildForecastPoints(
+            records = records,
+            months = settings.months,
+            sampleN = settings.sampleN,
+            mode = settings.mode,
+            customRateMonthly = settings.customRatePerMonth,  // ← 追加
+            customDeltaPerMonth = settings.customDeltaPerMonth,   // ★ 追加
+            drawdownStartMonth = settings.drawdownStartMonth,   // ← 渡す
+            withdrawPerMonth  = settings.withdrawPerMonth,      // ← 渡す
+            expenses = scheduledExpenses
+        )
+    }
+
+    LaunchedEffect(selectedId, selectedForecastEpoch, records, selectionSource) {
         if (selectionSource == SelectionSource.CHART && selectedId != null) {
             val sorted = records.sortedBy { it.dateEpochDays }
             val index = sorted.indexOfFirst { it.id == selectedId }
@@ -470,22 +462,20 @@ fun AppRoot(
 
             // 一度スクロールしたらフラグをリセット
             selectionSource = null
+        } else if (selectionSource == SelectionSource.CHART && selectedForecastEpoch != null) {
+            val index = forecasts.indexOfFirst { it.epochDays == selectedForecastEpoch }
+            if (index >= 0) {
+                // 予測行の位置 = 実績ヘッダー(1) + 実績(records.size) + 予測タイトル(1) + 予測ヘッダー(1) + index。
+                // 実績と同じく1つ手前の行を先頭にし、固定ヘッダーの下に選択行が見えるようにする。
+                listState.scrollToItem(records.size + 2 + index, scrollOffset = 0)
+            }
+
+            // 一度スクロールしたらフラグをリセット
+            selectionSource = null
         }
         // LIST の場合はスクロールなし
     }
 
-    val forecasts = remember(records, settings) {
-        buildForecastPoints(
-            records = records,
-            months = settings.months,
-            sampleN = settings.sampleN,
-            mode = settings.mode,
-            customRateMonthly = settings.customRatePerMonth,  // ← 追加
-            customDeltaPerMonth = settings.customDeltaPerMonth,   // ★ 追加
-            drawdownStartMonth = settings.drawdownStartMonth,   // ← 渡す
-            withdrawPerMonth  = settings.withdrawPerMonth       // ← 渡す
-        )
-    }
 // 予測用の月数が2ヶ月以上あるかを判定（同じ月内の複数レコードは1ヶ月として数える）
     val monthCount = remember(records) {
         records.groupBy { r ->
@@ -567,41 +557,51 @@ fun AppRoot(
                 val handleHeight = 12.dp                                  // つまみの高さ
                 val latestEpochDays: Int? = records.maxByOrNull { it.dateEpochDays }?.dateEpochDays
                 // グラフ（またはリスト）で選択中の記録の日付。ミニマップ上に選択位置をマーカー表示するために使う。
-                val selectedEpochDays: Int? = remember(records, selectedId) {
-                    selectedId?.let { id -> records.firstOrNull { it.id == id }?.dateEpochDays }
+                val selectedEpochDays: Int? = remember(records, selectedId, selectedForecastEpoch) {
+                    selectedId?.let { id -> records.firstOrNull { it.id == id }?.dateEpochDays } ?: selectedForecastEpoch
                 }
 
                 // ▼ ミニマップナビゲーターの選択範囲から実際のグラフ表示範囲を算出（null=全期間）
-                val displayRange: DisplayRange = customRange ?: DisplayRange(null, null)
+                // 予測期間の変更（例：10年→50年、50年→5年）で全期間が伸び縮みしても、保存済みの範囲が
+                // 全期間からはみ出したり、「末尾まで」のつもりが途中止まりになったりしないよう、全期間に合わせて補正する。
+                val fullStartEpoch = records.minOfOrNull { it.dateEpochDays }
+                val fullEndEpoch = forecasts.lastOrNull()?.epochDays ?: records.maxOfOrNull { it.dateEpochDays }
+                val displayRange: DisplayRange = normalizeDisplayRange(
+                    range = customRange,
+                    fullStart = fullStartEpoch,
+                    fullEnd = fullEndEpoch
+                )
+
+                // リストで選んだ点をグラフで選択状態にする。表示範囲の外なら、範囲の幅は変えずにその点が中央に来るようずらす。
+                fun selectInChart(epochDays: Int?, amount: Long, isForecast: Boolean) {
+                    if (epochDays != null && fullStartEpoch != null && fullEndEpoch != null) {
+                        val s = displayRange.start ?: fullStartEpoch
+                        val e = displayRange.end ?: fullEndEpoch
+                        if (epochDays !in s..e) {
+                            val width = e - s
+                            var ns = epochDays - width / 2
+                            var ne = ns + width
+                            if (ns < fullStartEpoch) { ns = fullStartEpoch; ne = fullStartEpoch + width }
+                            if (ne > fullEndEpoch) { ne = fullEndEpoch; ns = fullEndEpoch - width }
+                            customRange = normalizeDisplayRange(DisplayRange(ns, ne), fullStartEpoch, fullEndEpoch)
+                                .takeIf { it.start != null || it.end != null }
+                        }
+                    }
+                    chartHighlightRequest = ChartHighlightRequest(epochDays, amount, isForecast, ++chartHighlightSeq)
+                }
+                // 補正した範囲を保存値にも反映する（反映しないと、予測期間を元に戻した時に古い範囲が復活してしまう）。
+                // 記録の読み込み前（空）に補正すると保存済みの範囲が消えるので、記録がある時だけ行う。
+                // 設定（予測年数）も初期値のままだと全期間が正しくないので、読み込み後だけ行う。
+                LaunchedEffect(displayRange, displayRangeLoaded, settingsLoaded) {
+                    if (displayRangeLoaded && settingsLoaded && records.isNotEmpty()) {
+                        val normalized = displayRange.takeIf { it.start != null || it.end != null }
+                        if (customRange != normalized) customRange = normalized
+                    }
+                }
 
                 Column(Modifier.fillMaxSize()) {
 
-                    // ── 上：全期間（実績＋予測）の簡易推移＋現在の表示範囲ハイライト（ナビゲーター） ──
-                    // ミニマップの背景には常に実績・予測全体の推移が描かれているため、専用のリセット
-                    // ボタンは置かず、ハンドル／ハイライト枠のドラッグだけで全期間表示へ戻せるようにする。
-                    MiniMapNavigator(
-                        records = records,
-                        forecasts = forecasts,
-                        range = displayRange,
-                        selectedEpochDays = selectedEpochDays,
-                        onRangeChange = { newRange ->
-                            customRange = if (newRange.start == null && newRange.end == null) null else newRange
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 8.dp, vertical = 4.dp)
-                    )
-                    // ミニマップで選んだ期間の差分平均・増減率（グラフの高さを奪わないよう1行の小さな帯にする）。
-                    // ミニマップの補足情報なので控えめな文字にし、下の「選択中の日付・金額」との間は少し空けて別物に見せる。
-                    RangeStatsStrip(
-                        records = records,
-                        range = displayRange,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(start = 8.dp, end = 8.dp, bottom = 6.dp)
-                    )
-
-                    // ── ミニマップ下：グラフ（高さは split に応じて可変） ──
+                    // ── 上：グラフ（高さは split に応じて可変） ──
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -616,10 +616,17 @@ fun AppRoot(
                             customDeltaPerMonth = settings.customDeltaPerMonth,
                             drawdownStartMonth = settings.drawdownStartMonth,
                             withdrawPerMonth = settings.withdrawPerMonth,
+                            scheduledExpenses = scheduledExpenses,
                             range = displayRange,
-                            onPointSelected = { epochDaysOrNull: Int? ->
-                                selectedId = epochDaysOrNull?.let { picked ->
-                                    records.minByOrNull { r -> kotlin.math.abs(r.dateEpochDays - picked) }?.id
+                            onPointSelected = { epochDaysOrNull: Int?, isForecast: Boolean ->
+                                if (isForecast) {
+                                    selectedId = null
+                                    selectedForecastEpoch = epochDaysOrNull
+                                } else {
+                                    selectedForecastEpoch = null
+                                    selectedId = epochDaysOrNull?.let { picked ->
+                                        records.minByOrNull { r -> kotlin.math.abs(r.dateEpochDays - picked) }?.id
+                                    }
                                 }
                                 selectionSource = SelectionSource.CHART
                             },
@@ -627,9 +634,36 @@ fun AppRoot(
                                 .fillMaxSize() // ← Box 全体にグラフを広げる
                                 .padding(0.dp),
                             // ▼ 追加：初期ハイライトに最新実績を渡す
-                            initialHighlightEpochDays = latestEpochDays
+                            initialHighlightEpochDays = latestEpochDays,
+                            forecastAmounts = remember(forecasts) { forecasts.associate { it.epochDays to it.amount } },
+                            highlightRequest = chartHighlightRequest
                         )
                     }
+
+                    // ── グラフとリストの間：全期間（実績＋予測）の簡易推移＋現在の表示範囲ハイライト（ナビゲーター） ──
+                    // ミニマップの背景には常に実績・予測全体の推移が描かれているため、専用のリセット
+                    // ボタンは置かず、ハンドル／ハイライト枠のドラッグだけで全期間表示へ戻せるようにする。
+                    MiniMapNavigator(
+                        records = records,
+                        forecasts = forecasts,
+                        range = displayRange,
+                        selectedEpochDays = selectedEpochDays,
+                        onRangeChange = { newRange ->
+                            customRange = if (newRange.start == null && newRange.end == null) null else newRange
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 8.dp, end = 8.dp, top = 10.dp, bottom = 4.dp)   // 上はグラフの日付ラベルと詰まらないよう広め
+                    )
+                    // ミニマップで選んだ期間の差分平均・増減率（グラフの高さを奪わないよう1行の小さな帯にする）。
+                    // ミニマップの補足情報なので控えめな文字にし、下のつまみ・リストとの間は少し空けて別物に見せる。
+                    RangeStatsStrip(
+                        records = records,
+                        range = displayRange,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 8.dp, end = 8.dp, bottom = 6.dp)
+                    )
 
                     // ── 中央：ドラッグつまみ ──
                     Box(
@@ -689,8 +723,10 @@ fun AppRoot(
                                         selectionSource = null
                                     } else {
                                         selectedId = r.id
+                                        selectedForecastEpoch = null
                                         selectionSource =
                                             SelectionSource.LIST   // ← リスト由来なのでスクロールしない
+                                        selectInChart(r.dateEpochDays, r.amount, isForecast = false)
                                     }
                                 }
                             )
@@ -725,7 +761,21 @@ fun AppRoot(
                                 ForecastRow(
                                     p = p,
                                     diff = diff,                 // ← 差分
-                                    addFixed = p.addFixed ?: 0L  // ← 固定追加（未使用なら 0）
+                                    addFixed = p.addFixed ?: 0L, // ← 固定追加（未使用なら 0）
+                                    selected = p.epochDays == selectedForecastEpoch,
+                                    onClick = {
+                                        // 予測は編集できないので、もう一度タップしたら選択解除だけ
+                                        if (selectedForecastEpoch == p.epochDays) {
+                                            selectedForecastEpoch = null
+                                            selectionSource = null
+                                            selectInChart(null, 0L, isForecast = true)
+                                        } else {
+                                            selectedForecastEpoch = p.epochDays
+                                            selectedId = null
+                                            selectionSource = SelectionSource.LIST
+                                            selectInChart(p.epochDays, p.amount, isForecast = true)
+                                        }
+                                    }
                                 )
                             }
                         }
@@ -798,9 +848,13 @@ fun AppRoot(
             onSave = { vm.saveSettings(it) },
             onExportCsv = {
                 val name = "assets_${LocalDate.now()}.csv"
+                AdsManager.skipNextResumeAppOpen = true
                 exportLauncher.launch(name)
             },
             onImportCsv = {
+                AdsManager.skipNextResumeAppOpen = true
+                // 読み込んだ設定を、開いたままの設定画面の古い入力値で「保存」して上書きしないよう、先に閉じる
+                showSettings = false
                 importLauncher.launch("text/*") // 端末によっては "text/comma-separated-values" しか出ないケースがあるため広めに
             },
             // テーマだけを即時保存する。保存済みsettingsを基にするので、ダイアログで編集中の
@@ -814,7 +868,11 @@ fun AppRoot(
                         colorActual = c.actual, colorForecast = c.forecast
                     )
                 )
-            }
+            },
+            scheduledExpenses = scheduledExpenses,
+            onScheduledExpensesChange = { vm.saveScheduledExpenses(it) },
+            forecastStart = records.maxByOrNull { it.dateEpochDays }
+                ?.let { YearMonth.from(LocalDate.ofEpochDay(it.dateEpochDays.toLong())).plusMonths(1) }
         )
     }
 }
@@ -993,7 +1051,11 @@ fun SettingsDialog(
     onImportCsv: () -> Unit,     // ← 追加
     // テーマはチップを押した瞬間に保存・反映する（「保存」ボタンを待たずに見た目を確認できるように）
     onThemeModeChange: (String) -> Unit = {},
-    onSeriesColorsChange: (SeriesColorChoices) -> Unit = {}
+    onSeriesColorsChange: (SeriesColorChoices) -> Unit = {},
+    // 定期的な収支（追加・編集・削除はその場で保存）と、予測の最初の月（最新の記録の翌月）
+    scheduledExpenses: List<ScheduledExpense> = emptyList(),
+    onScheduledExpensesChange: (List<ScheduledExpense>) -> Unit = {},
+    forecastStart: YearMonth? = null
 ) {
     var mode by remember { mutableStateOf(current.mode) } // "avg" or "custom"
     var sampleChoice by remember { mutableStateOf(current.sampleN) } // 10/20/50/-1/カスタム値
@@ -1199,6 +1261,23 @@ fun SettingsDialog(
                         placeholder = "未設定（例: 50000）"
                     )
 
+                    Text(
+                        text = "定期的な収支",
+                        style = MaterialTheme.typography.labelMedium.copy(
+                            fontWeight = FontWeight.Bold
+                        ),
+                        color = MaterialTheme.colorScheme.primary,
+                        textAlign = TextAlign.Center
+                    )
+                    // 予測の最後の月は、入力中の予測年数で判定する（保存前でも「期間外」の表示が合うように）
+                    val editingMonths = yearsText.toIntOrNull()?.times(12) ?: current.months
+                    ScheduledExpenseSection(
+                        items = scheduledExpenses,
+                        onChange = onScheduledExpensesChange,
+                        forecastStart = forecastStart,
+                        forecastEnd = forecastStart?.takeIf { editingMonths > 0 }?.plusMonths(editingMonths - 1L)
+                    )
+
 //                Divider()
 //
 //                Row(
@@ -1282,7 +1361,16 @@ fun SettingsDialog(
                             modifier = Modifier.weight(1f)
                         ) { Text("export") }
                     }
-                    val uriHandler = LocalUriHandler.current
+                    // リンク先（ブラウザ等）から戻った時にアプリ起動広告が割り込まないよう、開く前に印を付ける
+                    val baseUriHandler = LocalUriHandler.current
+                    val uriHandler = remember(baseUriHandler) {
+                        object : androidx.compose.ui.platform.UriHandler {
+                            override fun openUri(uri: String) {
+                                AdsManager.skipNextResumeAppOpen = true
+                                baseUriHandler.openUri(uri)
+                            }
+                        }
+                    }
                     val privacyPolicyUrl = "https://journeygirl40.github.io/assetforecast/"
                     // 🔹 プライバシーポリシーリンクを追加
                     Divider()
@@ -1480,15 +1568,28 @@ fun AssetChartSection(
     customDeltaPerMonth: Long? = null,      // ★ 追加
     drawdownStartMonth: Int? = null,    // ← デフォルトを付ける
     withdrawPerMonth: Long? = null,     // ← デフォルトを付ける
+    scheduledExpenses: List<ScheduledExpense> = emptyList(), // 決まった月の収支（予測線に足し引きする）
     range: DisplayRange = DisplayRange(null, null), // ← ミニマップナビゲーターで選択された表示範囲
-    onPointSelected: (Int?) -> Unit = {},
-    initialHighlightEpochDays: Int? = null // ← これを追加
+    onPointSelected: (epochDays: Int?, isForecast: Boolean) -> Unit = { _, _ -> },
+    initialHighlightEpochDays: Int? = null, // ← これを追加
+    // 予測一覧に表示している金額（日付→金額）。選択中の金額表示を一覧と1円もずらさないために使う
+    forecastAmounts: Map<Int, Long> = emptyMap(),
+    // リストで選んだ点（グラフでも選択状態にする。epochDaysがnullなら選択解除）
+    highlightRequest: ChartHighlightRequest? = null
 ) {
-    val lastRangeKey = remember { mutableStateOf<Pair<Int?, Int?>?>(null) }
+    val lastRangeKey = remember { mutableStateOf<List<Any?>?>(null) }
+    // 起動直後の「最新の実績を選択」を済ませたか（以降はユーザーの選択を優先し、勝手に戻さない）
+    val initialHighlightDone = remember { mutableStateOf(false) }
     // 予測線が実際に描画されたか（データ不足等で描画されない月もあるため、凡例バッジの出し分けに使う）
     var hasForecast by remember { mutableStateOf(false) }
     // グラフで選択中の点。バッジ行の中央に日付・金額を表示するために使う（以前のふきだしMarkerの代わり）
     var selectedPoint by remember { mutableStateOf<SelectedChartPoint?>(null) }
+    // リストからの選択を読み取り欄に反映する。グラフのハイライトは、selectedPointの変化で走るupdateで当て直される
+    LaunchedEffect(highlightRequest) {
+        val req = highlightRequest ?: return@LaunchedEffect
+        selectedPoint = req.epochDays?.let { SelectedChartPoint(it.toLong(), req.amount, req.isForecast) }
+        if (req.epochDays != null) initialHighlightDone.value = true
+    }
 
     // MPAndroidChart(AndroidView)はComposeのMaterialTheme.colorSchemeを直接参照できないため、
     // ここでARGBに変換してfactory/updateへ渡す。ダーク/ライト切替時もupdateで毎回設定し直すことで追従させる。
@@ -1552,6 +1653,8 @@ fun AssetChartSection(
                 xAxis.setGranularityEnabled(true)
                 legend.isEnabled = false
                 setDrawMarkers(true)
+                // タップの縦位置は無視し、日付（X）が一番近い点を選ぶ
+                setHighlighter(XOnlyHighlighter(this))
 
                 // ▼ 追加：縦軸（Y軸）の金額文字サイズを小さく
                 axisLeft.textSize = 8f  // ← デフォルトは 10〜12f 程度。8fなら少し小さめ。
@@ -1576,7 +1679,8 @@ fun AssetChartSection(
                     (range.end == null || it.dateEpochDays <= range.end)
             }
             val actualEntries = displayed.map { r ->
-                Entry(r.dateEpochDays.toFloat(), r.amount.toFloat())
+                // グラフ用のyはFloatで端数が出るため、表示用に正確な金額をdataに持たせる
+                Entry(r.dateEpochDays.toFloat(), r.amount.toFloat(), r.amount)
             }
             val actualSet = LineDataSet(actualEntries, "実績").apply {
                 color = actualColorArgb
@@ -1632,8 +1736,10 @@ fun AssetChartSection(
                             }
 
                             // 率 → 固定額（切り崩しならマイナス）を反映
-                            amt = (if (rate != 0.0) amt * (1.0 + rate) else amt) + fixedThisMonth
-                            list += Entry(d.toEpochDay().toFloat(), amt.toFloat())
+                            amt = (if (rate != 0.0) amt * (1.0 + rate) else amt) + fixedThisMonth +
+                                scheduledExpenses.netFor(d.year, d.monthValue)
+                            val epochDay = d.toEpochDay().toInt()
+                            list += Entry(epochDay.toFloat(), amt.toFloat(), forecastAmounts[epochDay] ?: amt.roundToLong())
                         }
                         list
                     } else emptyList()
@@ -1673,12 +1779,14 @@ fun AssetChartSection(
                     val epochDays = e?.x?.toLong()?.toInt()
                     // 実績が範囲外だと予測線がindex 0になるため、indexではなくラベルで判定する
                     val isForecast = h?.let { chart.data?.getDataSetByIndex(it.dataSetIndex)?.label } == "予測"
-                    selectedPoint = e?.let { SelectedChartPoint(it.x.toLong(), it.y.toLong(), isForecast) }
-                    onPointSelected(epochDays)
+                    selectedPoint = e?.let {
+                        SelectedChartPoint(it.x.toLong(), (it.data as? Long) ?: it.y.roundToLong(), isForecast)
+                    }
+                    onPointSelected(epochDays, isForecast)
                 }
                 override fun onNothingSelected() {
                     selectedPoint = null
-                    onPointSelected(null)
+                    onPointSelected(null, false)
                 }
             })
             // X軸：日付表示（yy/MM）
@@ -1700,15 +1808,27 @@ fun AssetChartSection(
 
 // Y軸: 上側に余白（%）を追加して上端の点が切れないように
             chart.axisLeft.spaceTop = 25f   // 10〜20 の範囲でお好み
-// ▼ 初期ハイライト：最新の実績を選択状態にする（表示範囲内にある時だけ）
-            initialHighlightEpochDays?.let { epoch ->
-                if (displayed.any { it.dateEpochDays == epoch }) {
-                    chart.highlightValue(epoch.toFloat(), 0, true)
+// ▼ 選択中の点（グラフのタップ・リストのタップどちらでも）をハイライトし直す。
+            // dataを作り直すとハイライトが消えるため、updateのたびに現在の選択を当て直す（リスナーは呼ばない）。
+            // まだ何も選ばれていない起動直後だけ、最新の実績を選択状態にする（表示範囲内にある時だけ）。
+            val current = selectedPoint
+            if (current != null) {
+                if (!highlightChartPoint(chart, current)) chart.highlightValue(null, false)
+            } else if (!initialHighlightDone.value) {
+                initialHighlightEpochDays?.let { epoch ->
+                    if (displayed.any { it.dateEpochDays == epoch }) {
+                        chart.highlightValue(epoch.toFloat(), 0, true)
+                        initialHighlightDone.value = true
+                    }
                 }
+            } else {
+                chart.highlightValue(null, false)
             }
             // 表示範囲（ミニマップナビゲーターの選択）が変わった時だけビューをリセットする。
             // 無関係な再コンポジションで毎回呼ぶと、ユーザーのピンチズーム/パン操作が意図せずリセットされてしまう。
-            val rangeKey = range.start to range.end
+            // 範囲がnull（端まで）の時は、予測期間の変更などでデータの端が動いても軸を合わせ直す必要があるため、
+            // 実際に使う軸の端もキーに含める
+            val rangeKey = listOf(range.start, range.end, sorted.firstOrNull()?.dateEpochDays, forecastEndX)
             if (lastRangeKey.value != rangeKey) {
                 // fitScreen()はxAxisのaxisMinimum/axisMaximumに対してズーム・パンの変換行列を
                 // リセットするだけだが、axisMinimum/axisMaximumを明示設定していないとMPAndroidChartは
@@ -1830,6 +1950,32 @@ private fun RangeStatsStrip(records: List<AssetRecord>, range: DisplayRange, mod
 }
 
 // グラフで選択中の点（x=epochDays, y=金額）。予測線上の点かどうかで表示色を変える。
+// MPAndroidChart標準の選択は、実績線・予測線それぞれの最寄り点のうち「タップの縦位置に近い方」を選ぶため、
+// 線から離れた所を押すと隣の線（例：予測区間なのに最新の実績）が選ばれてしまう。X（日付）の近さだけで選ぶ。
+private class XOnlyHighlighter(chart: LineChart) :
+    com.github.mikephil.charting.highlight.ChartHighlighter<LineChart>(chart) {
+    override fun getHighlight(x: Float, y: Float): Highlight? {
+        val pos = getValsForTouch(x, y)
+        val xVal = pos.x.toFloat()
+        MPPointD.recycleInstance(pos)
+        return getHighlightsAtXValue(xVal, x, y).minByOrNull { kotlin.math.abs(it.x - xVal) }
+    }
+}
+
+// リストで選んだ点をグラフに伝えるための依頼。seqは同じ点を選び直した時も反映させるための連番
+data class ChartHighlightRequest(val epochDays: Int?, val amount: Long, val isForecast: Boolean, val seq: Long)
+
+// 選択中の点をグラフ上でハイライトする（実績/予測はデータセットのラベルで探す）。その点が今のデータに無ければfalse
+private fun highlightChartPoint(chart: LineChart, p: SelectedChartPoint): Boolean {
+    val data = chart.data ?: return false
+    val label = if (p.isForecast) "予測" else "実績"
+    val index = (0 until data.dataSetCount).firstOrNull { data.getDataSetByIndex(it).label == label } ?: return false
+    val x = p.epochDays.toFloat()
+    if (data.getDataSetByIndex(index).getEntriesForXValue(x).isEmpty()) return false
+    chart.highlightValue(x, index, false)
+    return true
+}
+
 private data class SelectedChartPoint(val epochDays: Long, val amount: Long, val isForecast: Boolean)
 
 // バッジ行の中央に出す選択中の点の読み取り表示。証券アプリの価格表示風に、
@@ -1899,18 +2045,21 @@ private fun MiniMapNavigator(
     // 必ず数ヶ月分のデータが入る粒度に制限する。
     val minRangeDays = 90
 
-    val highlightStart = range.start ?: fullStart
-    val highlightEnd = range.end ?: fullEnd
+    val highlightStart = (range.start ?: fullStart).coerceIn(fullStart, fullEnd)
+    val highlightEnd = (range.end ?: fullEnd).coerceIn(highlightStart, fullEnd)
 
     // detectDragGestures のコールバック内から常に最新のハイライト範囲／コールバックを参照するため
     val currentHighlight by rememberUpdatedState(highlightStart to highlightEnd)
     val currentOnRangeChange by rememberUpdatedState(onRangeChange)
 
-    fun emitRange(newStart: Int, newEnd: Int) {
+    // 期間が長い（予測50年など）と1pxが数十日になり、指でぴったり端まで寄せるのが難しい。
+    // ハンドル操作では端から少し手前まで来たら端に吸着させる。
+    fun emitRange(newStart: Int, newEnd: Int, snapToEdges: Boolean = false) {
+        val snapDays = if (snapToEdges && widthPx > 0f) (with(density) { 12.dp.toPx() } / widthPx * fullSpan).roundToInt() else 0
         currentOnRangeChange(
             DisplayRange(
-                start = if (newStart <= fullStart) null else newStart,
-                end = if (newEnd >= fullEnd) null else newEnd
+                start = if (newStart <= fullStart + snapDays) null else newStart,
+                end = if (newEnd >= fullEnd - snapDays) null else newEnd
             )
         )
     }
@@ -2000,16 +2149,23 @@ private fun MiniMapNavigator(
                     .width(handleWidthDp)
                     .fillMaxHeight()
                     .pointerInput(gestureKey) {
-                        detectDragGestures { change, dragAmount ->
+                        // 端への吸着があるため、1回ごとの移動量ではなくドラッグ開始位置からの累計で位置を決める
+                        // （毎回の小さな移動量だと吸着範囲から抜け出せなくなる）
+                        var anchorStart = 0
+                        var totalDx = 0f
+                        detectDragGestures(
+                            onDragStart = { anchorStart = currentHighlight.first; totalDx = 0f }
+                        ) { change, dragAmount ->
                             change.consume()
                             if (widthPx <= 0f) return@detectDragGestures
-                            val (hs, he) = currentHighlight
-                            val deltaEpoch = (dragAmount.x / widthPx * fullSpan).roundToInt()
+                            val he = currentHighlight.second
+                            totalDx += dragAmount.x
+                            val deltaEpoch = (totalDx / widthPx * fullSpan).roundToInt()
                             // he-minRangeDaysがfullStartを下回り得る（heがfullStartに極めて近い場合）ため、
                             // coerceInの上限がfullStart未満にならないようクランプしてから使う
                             val upperBound = (he - minRangeDays).coerceAtLeast(fullStart)
-                            val newStart = (hs + deltaEpoch).coerceIn(fullStart, upperBound)
-                            emitRange(newStart, he)
+                            val newStart = (anchorStart + deltaEpoch).coerceIn(fullStart, upperBound)
+                            emitRange(newStart, he, snapToEdges = true)
                         }
                     },
                 contentAlignment = Alignment.Center
@@ -2029,16 +2185,21 @@ private fun MiniMapNavigator(
                     .width(handleWidthDp)
                     .fillMaxHeight()
                     .pointerInput(gestureKey) {
-                        detectDragGestures { change, dragAmount ->
+                        var anchorEnd = 0
+                        var totalDx = 0f
+                        detectDragGestures(
+                            onDragStart = { anchorEnd = currentHighlight.second; totalDx = 0f }
+                        ) { change, dragAmount ->
                             change.consume()
                             if (widthPx <= 0f) return@detectDragGestures
-                            val (hs, he) = currentHighlight
-                            val deltaEpoch = (dragAmount.x / widthPx * fullSpan).roundToInt()
+                            val hs = currentHighlight.first
+                            totalDx += dragAmount.x
+                            val deltaEpoch = (totalDx / widthPx * fullSpan).roundToInt()
                             // hs+minRangeDaysがfullEndを上回り得る（hsがfullEndに極めて近い場合）ため、
                             // coerceInの下限がfullEndを超えないようクランプしてから使う
                             val lowerBound = (hs + minRangeDays).coerceAtMost(fullEnd)
-                            val newEnd = (he + deltaEpoch).coerceIn(lowerBound, fullEnd)
-                            emitRange(hs, newEnd)
+                            val newEnd = (anchorEnd + deltaEpoch).coerceIn(lowerBound, fullEnd)
+                            emitRange(hs, newEnd, snapToEdges = true)
                         }
                     },
                 contentAlignment = Alignment.Center
@@ -2218,14 +2379,29 @@ private fun RecordRow(
 
 // === ここは RecordRow のすぐ下に置く ===
 @Composable
-private fun ForecastRow(p: ForecastPoint, diff: Long, addFixed: Long ) {
+private fun ForecastRow(
+    p: ForecastPoint,
+    diff: Long,
+    addFixed: Long,
+    selected: Boolean = false,
+    onClick: () -> Unit = {}
+) {
     val date = LocalDate.ofEpochDay(p.epochDays.toLong())
     val grey = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+    // 選択時のハイライトは実績行と同じ色にそろえる
+    val targetColor = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f) else ComposeColor.Transparent
+    val bg by animateColorAsState(targetValue = targetColor, label = "forecastRowBg")
 
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(bg)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 2.dp)
+    ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 2.dp)
             .heightIn(min = 32.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -2265,6 +2441,48 @@ private fun ForecastRow(p: ForecastPoint, diff: Long, addFixed: Long ) {
         )
 
     }
+    // 定期的な収支がある月だけ、その内訳を行の下に小さく出す（差分が急に変わった理由が分かるように）。
+    if (p.scheduledItems.isNotEmpty()) {
+        val seriesColors = LocalSeriesColors.current
+        // 1件ずつ小さなラベルにして横に並べ、入りきらなければ折り返す（件数が増えても縦に伸びすぎないように）。
+        // ラベルはそれぞれの符号に合わせた設定の増減色でうっすら塗り、金額の文字も同じ色にする。
+        @OptIn(ExperimentalLayoutApi::class)
+        FlowRow(
+            modifier = Modifier.padding(bottom = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            p.scheduledItems.forEach { (name, signed) ->
+                val c = if (signed >= 0) seriesColors.gain else seriesColors.loss
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(c.copy(alpha = 0.12f))
+                        .border(0.5.dp, c.copy(alpha = 0.45f), RoundedCornerShape(6.dp))
+                        .padding(horizontal = 6.dp, vertical = 1.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = name,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        modifier = Modifier.widthIn(max = 96.dp)
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        text = formatScheduledYen(signed),
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = c,
+                        maxLines = 1
+                    )
+                }
+            }
+        }
+    }
+    }
     HorizontalDivider(thickness = 0.5.dp, color = grey.copy(alpha = 0.4f))
 }
 
@@ -2273,6 +2491,16 @@ private fun ForecastRow(p: ForecastPoint, diff: Long, addFixed: Long ) {
 // ミニマップナビゲーターのハイライト枠が全期間の端に達している側はnull（予測線は末尾まで表示）。
 // AssetChartSection（public）のパラメータ型として使うため可視性はpublicにする。
 data class DisplayRange(val start: Int?, val end: Int?)
+
+// 表示範囲を全期間[fullStart, fullEnd]に収める。端に達した側はnull（＝端まで）にし、
+// 範囲が全期間の外に出てしまった時は全期間表示に戻す。
+private fun normalizeDisplayRange(range: DisplayRange?, fullStart: Int?, fullEnd: Int?): DisplayRange {
+    if (range == null || fullStart == null || fullEnd == null || fullEnd <= fullStart) return DisplayRange(null, null)
+    val start = range.start?.takeIf { it > fullStart }
+    val end = range.end?.takeIf { it < fullEnd }
+    if ((start ?: fullStart) >= (end ?: fullEnd)) return DisplayRange(null, null)
+    return DisplayRange(start, end)
+}
 
 // 月ごとの平均資産額 → 月次増減率の平均を返す（直近 sampleMonths 分）
 // sampleMonths <= 0 なら全期間
@@ -2319,7 +2547,9 @@ private data class ForecastPoint(
     val amount: Long,
     val diff: Long,       // 前月との差分（予測）
     val fixedAdd: Long,    // その月に足した固定額
-    val addFixed: Long = 0L        // ★ 追加：その月に加算した固定額
+    val addFixed: Long = 0L,        // ★ 追加：その月に加算した固定額
+    val scheduled: Long = 0L,        // その月に足し引きした定期的な収支の合計（支出はマイナス）
+    val scheduledItems: List<Pair<String, Long>> = emptyList() // その内訳（名前と符号付きの金額。一覧に小さく表示する）
 )
 // 直近Nか月の平均“率”を使って、将来monthsか月ぶんの予測点を作る
 private fun buildForecastPoints(
@@ -2331,7 +2561,8 @@ private fun buildForecastPoints(
     customDeltaPerMonth: Long?,      // ★ 追加
     drawdownStartMonth: Int?,          // 予測開始からの経過“月”ではなく“年単位→月換算済み”
     withdrawPerMonth: Long?,           // 切り崩し（円/月）
-    fixedAddPerMonth: Long = 0L      // ★ 追加：毎月の固定加算額（0 なら加算なし）
+    fixedAddPerMonth: Long = 0L,     // ★ 追加：毎月の固定加算額（0 なら加算なし）
+    expenses: List<ScheduledExpense> = emptyList() // 決まった月の収支（ローン、ボーナスなど）
 
 ): List<ForecastPoint> {
     if (records.isEmpty() || months <= 0) return emptyList()
@@ -2376,7 +2607,12 @@ private fun buildForecastPoints(
         else
             prevAmount
 
+        // 定期的な収支（その年月に該当するものの合計。支出はマイナス）を足し引きする
+        val applied = expenses.filter { it.appliesTo(d.year, d.monthValue) }
+        val scheduledThisMonth = applied.sumOf { it.signedAmount }
+
         val nextAmountBD = afterRate.add(BigDecimal.valueOf(fixedThisMonth.toDouble()))
+            .add(BigDecimal.valueOf(scheduledThisMonth))
 
         // 小数点以下を四捨五入してLong化
         val nextAmount = nextAmountBD.setScale(0, RoundingMode.HALF_UP).toLong()
@@ -2386,7 +2622,9 @@ private fun buildForecastPoints(
             amount = nextAmount,
             diff = nextAmount - prevAmount.setScale(0, RoundingMode.HALF_UP).toLong(),
             fixedAdd = fixedThisMonth,
-            addFixed = fixedAddPerMonth
+            addFixed = fixedAddPerMonth,
+            scheduled = scheduledThisMonth,
+            scheduledItems = applied.map { it.displayName() to it.signedAmount }
         )
 
         prevAmount = nextAmountBD
@@ -2823,15 +3061,21 @@ private fun SettingsField(
     suffix: String? = null,
     placeholder: String = "未設定",
     supportingText: String? = null,
-    keyboardType: KeyboardType = KeyboardType.Number
+    keyboardType: KeyboardType = KeyboardType.Number,
+    labelTrailing: (@Composable () -> Unit)? = null   // ラベル行の右端に置く小さな部品（切り替えなど）
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(start = 4.dp)
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier
+                    .padding(start = 4.dp)
+                    .weight(1f)
+            )
+            labelTrailing?.invoke()
+        }
         OutlinedTextField(
             value = value,
             onValueChange = onValueChange,
@@ -2857,6 +3101,397 @@ private fun SettingsField(
             modifier = Modifier.fillMaxWidth()
         )
     }
+}
+
+// ── 定期的な収支（決まった月に予測へ足し引きする） ──
+
+// 名前が空の時は「支出」「収入」と表示する
+private fun ScheduledExpense.displayName(): String = name.ifBlank { if (isIncome) "収入" else "支出" }
+
+// 符号付きの金額表示（例「−¥50,000」「+¥300,000」）
+private fun formatScheduledYen(signed: Long): String =
+    (if (signed < 0) "−¥" else "+¥") + formatYen(kotlin.math.abs(signed))
+
+// 一覧や編集画面に出す「いつ・何回」の説明文
+private fun ScheduledExpense.scheduleText(): String = when (repeat) {
+    ExpenseRepeat.ONCE -> "${startYear}年${month}月の1回"
+    ExpenseRepeat.YEARLY_FOREVER -> "毎年${month}月・${startYear}年からずっと"
+    ExpenseRepeat.YEARLY_YEARS -> "毎年${month}月・${startYear}〜${endYear}年（${years}回）"
+}
+
+// 編集画面の確認用の文（例：「2025〜2034年の毎年12月に ¥50,000（10回）」）
+private fun ScheduledExpense.previewText(): String = formatScheduledYen(signedAmount).let { yen ->
+    when (repeat) {
+        ExpenseRepeat.ONCE -> "${startYear}年${month}月に 1回だけ $yen"
+        ExpenseRepeat.YEARLY_FOREVER -> "${startYear}年から毎年${month}月に $yen（ずっと）"
+        ExpenseRepeat.YEARLY_YEARS -> "${startYear}〜${endYear}年の毎年${month}月に $yen（${years}回）"
+    }
+}
+
+// 予測期間 [forecastStart, forecastEnd] の中で実際に差し引かれる回数
+private fun ScheduledExpense.countWithin(forecastStart: YearMonth?, forecastEnd: YearMonth?): Int? {
+    if (forecastStart == null || forecastEnd == null || forecastEnd < forecastStart) return null
+    var count = 0
+    var y = maxOf(startYear, forecastStart.year)
+    while (y <= forecastEnd.year && (endYear == null || y <= endYear!!)) {
+        val ym = YearMonth.of(y, month)
+        if (ym >= forecastStart && ym <= forecastEnd && y >= startYear) count++
+        y++
+    }
+    return count
+}
+
+// 設定ダイアログ内の「定期的な収支」セクション。項目のタップで編集、スイッチで一時的に外す、＋で追加。
+// 変更はその場で保存する（設定ダイアログの「保存」を押し忘れても消えないように）。
+@Composable
+private fun ScheduledExpenseSection(
+    items: List<ScheduledExpense>,
+    onChange: (List<ScheduledExpense>) -> Unit,
+    forecastStart: YearMonth?,
+    forecastEnd: YearMonth?
+) {
+    // null=閉じている。id=0Lの新規項目なら「追加」、それ以外は「編集」
+    var editing by remember { mutableStateOf<ScheduledExpense?>(null) }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = "ローンやボーナスなど、決まった月の支出・収入を予測に反映します",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        items.forEach { e ->
+            ScheduledExpenseItem(
+                item = e,
+                outOfRange = e.countWithin(forecastStart, forecastEnd) == 0,
+                onClick = { editing = e },
+                onEnabledChange = { on ->
+                    onChange(items.map { if (it.id == e.id) it.copy(enabled = on) else it })
+                }
+            )
+        }
+        OutlinedButton(
+            onClick = {
+                val base = forecastStart ?: YearMonth.now().plusMonths(1)
+                editing = ScheduledExpense(
+                    id = 0L, name = "", amount = 0L, month = 12,
+                    startYear = if (12 >= base.monthValue) base.year else base.year + 1,
+                    repeat = ExpenseRepeat.YEARLY_YEARS, years = 10
+                )
+            },
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(10.dp)
+        ) {
+            Text("＋ 追加")
+        }
+    }
+
+    editing?.let { target ->
+        ScheduledExpenseEditor(
+            initial = target,
+            isNew = target.id == 0L,
+            forecastStart = forecastStart,
+            forecastEnd = forecastEnd,
+            onDismiss = { editing = null },
+            onSave = { saved ->
+                onChange(
+                    if (target.id == 0L) items + saved.copy(id = System.currentTimeMillis())
+                    else items.map { if (it.id == saved.id) saved else it }
+                )
+                editing = null
+            },
+            onDelete = {
+                onChange(items.filterNot { it.id == target.id })
+                editing = null
+            }
+        )
+    }
+}
+
+@Composable
+private fun ScheduledExpenseItem(
+    item: ScheduledExpense,
+    outOfRange: Boolean,
+    onClick: () -> Unit,
+    onEnabledChange: (Boolean) -> Unit
+) {
+    // OFFの項目は薄く表示して「今は計算に入っていない」ことを分かるようにする
+    val contentAlpha = if (item.enabled) 1f else 0.45f
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+            .clickable(onClick = onClick)
+            .padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(
+            Modifier
+                .weight(1f)
+                .alpha(contentAlpha)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = item.displayName(),
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false)
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = formatScheduledYen(item.signedAmount),
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontFamily = com.journeygirl.assetforecast.ui.theme.NumberFontFamily,
+                    color = if (item.isIncome) LocalSeriesColors.current.gain else LocalSeriesColors.current.loss,
+                    maxLines = 1
+                )
+            }
+            Text(
+                text = item.scheduleText(),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1
+            )
+            if (outOfRange && item.enabled) {
+                Text(
+                    text = "予測期間の外なので反映されません",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+        }
+        Switch(
+            checked = item.enabled,
+            onCheckedChange = onEnabledChange,
+            modifier = Modifier.scale(0.8f)
+        )
+    }
+}
+
+// 「支出｜収入」の2択。選んだ側を増減の色で塗る（支出＝減った時の色、収入＝増えた時の色）
+@Composable
+private fun IncomeExpenseToggle(isIncome: Boolean, onChange: (Boolean) -> Unit) {
+    val colors = LocalSeriesColors.current
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+    ) {
+        listOf(false to "支出", true to "収入").forEach { (income, label) ->
+            val selected = isIncome == income
+            Box(
+                Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (selected) (if (income) colors.gain else colors.loss) else ComposeColor.Transparent)
+                    .clickable { onChange(income) }
+                    .padding(horizontal = 14.dp, vertical = 4.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                    color = if (selected) ComposeColor.White else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ScheduledExpenseEditor(
+    initial: ScheduledExpense,
+    isNew: Boolean,
+    forecastStart: YearMonth?,
+    forecastEnd: YearMonth?,
+    onDismiss: () -> Unit,
+    onSave: (ScheduledExpense) -> Unit,
+    onDelete: () -> Unit
+) {
+    var name by remember { mutableStateOf(initial.name) }
+    var amountText by remember { mutableStateOf(initial.amount.takeIf { it > 0 }?.toString() ?: "") }
+    var isIncome by remember { mutableStateOf(initial.isIncome) }
+    var month by remember { mutableStateOf(initial.month) }
+    var repeat by remember { mutableStateOf(initial.repeat) }
+    var yearText by remember { mutableStateOf(initial.startYear.toString()) }
+    var yearsText by remember { mutableStateOf(initial.years.toString()) }
+    // 新規追加で年を自分で入力していない間は、月を変えたら「予測の中で最初に来るその月」の年に合わせる
+    var yearTouched by remember { mutableStateOf(!isNew) }
+
+    val amount = amountText.toLongOrNull() ?: 0L
+    val year = yearText.toIntOrNull()?.takeIf { it in 1900..2300 }
+    val years = yearsText.toIntOrNull()?.takeIf { it in 1..100 }
+    val draft = if (year != null && (repeat != ExpenseRepeat.YEARLY_YEARS || years != null)) {
+        initial.copy(
+            name = name.trim(), amount = amount, month = month, startYear = year,
+            repeat = repeat, years = years ?: 1, enabled = initial.enabled, isIncome = isIncome
+        )
+    } else null
+    val canSave = draft != null && amount > 0
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (isNew) "収支を追加" else "収支を編集") },
+        text = {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 520.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                SettingsField(
+                    value = name,
+                    onValueChange = { name = it.take(20) },
+                    label = "名前",
+                    placeholder = "例: ローン、ボーナス",
+                    keyboardType = KeyboardType.Text
+                )
+                SettingsField(
+                    value = amountText,
+                    onValueChange = { amountText = it.filter { ch -> ch.isDigit() }.take(10) },
+                    label = "金額（1回あたり）",
+                    suffix = "円",
+                    placeholder = "例: 50000",
+                    // 支出か収入かは、項目を増やさず金額ラベルの横の切り替えだけで選ぶ
+                    labelTrailing = { IncomeExpenseToggle(isIncome = isIncome, onChange = { isIncome = it }) }
+                )
+
+                // 月：12個のボタンから1つ選ぶ（数字入力より押し間違いが少なく、一目で分かる）
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        text = "月",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 4.dp)
+                    )
+                    (1..12).chunked(6).forEach { row ->
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            row.forEach { m ->
+                                val selected = m == month
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(36.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(
+                                            if (selected) MaterialTheme.colorScheme.primary
+                                            else MaterialTheme.colorScheme.surfaceContainerHighest
+                                        )
+                                        .clickable {
+                                            month = m
+                                            if (!yearTouched) {
+                                                val base = forecastStart ?: YearMonth.now().plusMonths(1)
+                                                yearText = (if (m >= base.monthValue) base.year else base.year + 1).toString()
+                                            }
+                                        },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = "${m}月",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = if (selected) MaterialTheme.colorScheme.onPrimary
+                                        else MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 繰り返し：3択をラジオボタンで縦に並べる（選択肢の意味が文章で読めるように）
+                Column {
+                    Text(
+                        text = "繰り返し",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 4.dp)
+                    )
+                    listOf(
+                        ExpenseRepeat.ONCE to "1回だけ",
+                        ExpenseRepeat.YEARLY_YEARS to "毎年（期間を指定）",
+                        ExpenseRepeat.YEARLY_FOREVER to "毎年（ずっと）"
+                    ).forEach { (value, label) ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { repeat = value }
+                                .padding(end = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(selected = repeat == value, onClick = { repeat = value })
+                            Text(label, style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Box(Modifier.weight(1f)) {
+                        SettingsField(
+                            value = yearText,
+                            onValueChange = { yearText = it.filter { ch -> ch.isDigit() }.take(4); yearTouched = true },
+                            label = if (repeat == ExpenseRepeat.ONCE) "年" else "開始する年",
+                            suffix = "年"
+                        )
+                    }
+                    if (repeat == ExpenseRepeat.YEARLY_YEARS) {
+                        Box(Modifier.weight(1f)) {
+                            SettingsField(
+                                value = yearsText,
+                                onValueChange = { yearsText = it.filter { ch -> ch.isDigit() }.take(3) },
+                                label = "期間",
+                                suffix = "年間"
+                            )
+                        }
+                    }
+                }
+
+                // 入力内容を文章で確認できるようにする（「何年の何月から何回」を取り違えないように）
+                if (draft != null && amount > 0) {
+                    val count = draft.countWithin(forecastStart, forecastEnd)
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.10f))
+                            .padding(10.dp)
+                    ) {
+                        Text(
+                            text = draft.previewText(),
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                        if (count != null) {
+                            Text(
+                                text = if (count > 0) "予測期間の中では ${count} 回、合計 ¥${formatYen(amount * count)} を" +
+                                    (if (isIncome) "足します" else "差し引きます")
+                                else "予測期間（〜${forecastEnd!!.year}年${forecastEnd.monthValue}月）の外なので反映されません",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (count > 0) MaterialTheme.colorScheme.onSurfaceVariant
+                                else MaterialTheme.colorScheme.error
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { draft?.let(onSave) }, enabled = canSave) { Text("保存") }
+        },
+        dismissButton = {
+            Row {
+                if (!isNew) {
+                    TextButton(onClick = onDelete) {
+                        Text("削除", color = MaterialTheme.colorScheme.error)
+                    }
+                }
+                TextButton(onClick = onDismiss) { Text("キャンセル") }
+            }
+        }
+    )
 }
 
 @Composable

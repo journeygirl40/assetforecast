@@ -25,8 +25,8 @@ android {
         applicationId = "com.journeygirl.assetforecast"
         minSdk = 24
         targetSdk = 36  // Google Play: 2026/8/31以降のアップデートはAPI 36以上が必須
-        versionCode = 22
-        versionName = "3.9"
+        versionCode = 23
+        versionName = "4.0"
     }
 
     signingConfigs {

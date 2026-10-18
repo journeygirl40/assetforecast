@@ -66,6 +66,10 @@ object AdsManager {
     @Volatile var isShowingFullScreenAd = false
         private set
 
+    // アプリ自身がファイル選択やブラウザなど外の画面を開いた時に立てる。そこから戻った時は
+    // 「裏から戻った」扱いにせず、アプリ起動広告を出さない（操作の途中に広告が割り込まないように）。
+    @Volatile var skipNextResumeAppOpen = false
+
     private fun fullScreenCooldownPassed(now: Long) =
         lastFullScreenAdAt?.let { now - it >= FULLSCREEN_MIN_INTERVAL_MS } ?: true
 

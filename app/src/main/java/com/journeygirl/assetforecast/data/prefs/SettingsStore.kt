@@ -58,6 +58,7 @@ class SettingsStore(private val context: Context) {
         val WITHDRAW_PER_MONTH   = longPreferencesKey("withdraw_per_month")
         val DISPLAY_RANGE_START = intPreferencesKey("display_range_start")
         val DISPLAY_RANGE_END = intPreferencesKey("display_range_end")
+        val SCHEDULED_EXPENSES = stringPreferencesKey("scheduled_expenses")
     }
 
     val settingsFlow: Flow<ForecastSettings> =
@@ -129,6 +130,18 @@ class SettingsStore(private val context: Context) {
         context.dataStore.data.map { p ->
             DisplayRangePrefs(start = p[Keys.DISPLAY_RANGE_START], end = p[Keys.DISPLAY_RANGE_END])
         }
+
+    // 定期的な支出は件数が増減し、追加・削除のたびにその場で保存するため、ForecastSettingsとは分離している
+    // （設定ダイアログの「保存」が古い一覧で上書きしないように）。
+    val scheduledExpensesFlow: Flow<List<ScheduledExpense>> =
+        context.dataStore.data.map { p -> decodeScheduledExpenses(p[Keys.SCHEDULED_EXPENSES]) }
+
+    suspend fun saveScheduledExpenses(list: List<ScheduledExpense>) {
+        context.dataStore.edit { p ->
+            if (list.isEmpty()) p.remove(Keys.SCHEDULED_EXPENSES)
+            else p[Keys.SCHEDULED_EXPENSES] = encodeScheduledExpenses(list)
+        }
+    }
 
     suspend fun saveDisplayRange(start: Int?, end: Int?) {
         context.dataStore.edit { p ->
